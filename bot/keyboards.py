@@ -160,6 +160,58 @@ def cancel_input_keyboard(*, language: str, callback_data: str = "menu:cancel") 
     return builder.as_markup()
 
 
+def history_button_keyboard(*, language: str) -> InlineKeyboardMarkup:
+    """Кнопка для открытия истории чатов."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📜 " + t(language, "btn_history"), callback_data="menu:history:0")
+    builder.button(text=t(language, "btn_back"), callback_data="menu:home")
+    builder.adjust(1, 1)
+    return builder.as_markup()
+
+
+def history_menu_keyboard(*, language: str) -> InlineKeyboardMarkup:
+    """Меню для работы с историей чатов."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📜 " + t(language, "btn_history"), callback_data="menu:history:0")
+    builder.button(text="📝 " + t(language, "btn_newchat"), callback_data="menu:newchat")
+    builder.button(text="⚙️ " + t(language, "btn_settings"), callback_data="menu:settings")
+    builder.button(text="🏠 " + t(language, "btn_back"), callback_data="menu:home")
+    builder.adjust(2, 2)
+    return builder.as_markup()
+
+
+def history_navigation_keyboard(*, language: str, page: int, total: int, show_manage: bool = True) -> InlineKeyboardMarkup:
+    """Навигация по истории с управлением чатами."""
+    builder = InlineKeyboardBuilder()
+    
+    # Navigation buttons
+    layout: list[int] = []
+    if total > 1:
+        nav_count = 0
+        if page > 0:
+            builder.button(text="⬅️ " + t(language, "btn_back"), callback_data=f"menu:history:{page - 1}")
+            nav_count += 1
+        builder.button(text=f"{page + 1}/{total}", callback_data="menu:noop")
+        nav_count += 1
+        if page < total - 1:
+            builder.button(text=t(language, "btn_back") + " ➡️", callback_data=f"menu:history:{page + 1}")
+            nav_count += 1
+        layout.append(nav_count)
+    
+    # Chat management
+    if show_manage:
+        builder.button(text="📂 " + t(language, "btn_open_chat"), callback_data=f"menu:openchat:{page}")
+        builder.button(text="🗑️ " + t(language, "btn_delete_chat"), callback_data=f"menu:deletechat:{page}")
+        layout.append(2)
+    
+    builder.button(text="📝 " + t(language, "btn_newchat"), callback_data="menu:newchat")
+    builder.button(text="🏠 " + t(language, "btn_back"), callback_data="menu:home")
+    layout.append(2)
+    
+    builder.adjust(*layout)
+    return builder.as_markup()
+
+
 def quick_model_selection_keyboard(*, language: str) -> InlineKeyboardMarkup:
     """Быстрый выбор модели для shared AI."""
     builder = InlineKeyboardBuilder()
@@ -224,8 +276,9 @@ def settings_quick_keyboard(*, language: str) -> InlineKeyboardMarkup:
     builder.button(text="🔑 " + t(language, "btn_apikey"), callback_data="menu:apikey")
     builder.button(text="🌐 " + t(language, "btn_language"), callback_data="menu:language")
     builder.button(text="🔗 " + t(language, "btn_baseurl"), callback_data="menu:baseurl")
+    builder.button(text="📜 " + t(language, "btn_history"), callback_data="menu:history:0")
     builder.button(text=t(language, "btn_back"), callback_data="menu:home")
-    builder.adjust(2, 2, 2, 1)
+    builder.adjust(2, 2, 2, 2)
     return builder.as_markup()
 
 
