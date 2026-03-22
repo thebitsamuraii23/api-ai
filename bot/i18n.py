@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SUPPORTED_LANGUAGES = ("en", "ru", "es", "fr", "tr", "ar")
+SUPPORTED_LANGUAGES = ("en", "ru", "es", "fr", "tr", "ar", "de", "it", "pt", "uk", "hi")
 SUPPORTED_PERSONALITIES = (
     "default",
     "lawyer",
@@ -15,10 +15,13 @@ SUPPORTED_PERSONALITIES = (
     "poet",
     "philosopher",
     "genius",
+    "bro",
     "manipulator",
     "liar",
     "historian",
     "critic",
+    "mathematician",
+    "dushnila",
 )
 
 LANGUAGE_LABELS: dict[str, str] = {
@@ -28,6 +31,11 @@ LANGUAGE_LABELS: dict[str, str] = {
     "fr": "🇫🇷 Francais",
     "tr": "🇹🇷 Turkce",
     "ar": "🇸🇦 العربية",
+    "de": "🇩🇪 Deutsch",
+    "it": "🇮🇹 Italiano",
+    "pt": "🇵🇹 Portugues",
+    "uk": "🇺🇦 Українська",
+    "hi": "🇮🇳 हिन्दी",
 }
 
 TEXTS: dict[str, dict[str, str]] = {
@@ -39,11 +47,11 @@ TEXTS: dict[str, dict[str, str]] = {
             "🚀 Quick start:\n"
             "1. Choose provider\n"
             "2. Add API key\n"
-            "3. Start chatting"
+            "3. Start chatting\n\n"
+            "🌐 Internet search: use /i \"query\""
         ),
         "help": (
             "📚 Commands:\n"
-            "• /menu - open the main inline menu\n"
             "• /language - choose interface language\n"
             "• /provider - choose AI provider\n"
             "• /personality - choose AI personality\n"
@@ -52,11 +60,31 @@ TEXTS: dict[str, dict[str, str]] = {
             "• /model - set model name\n"
             "• /baseurl - set base URL (custom provider)\n"
             "• /settings - show your settings\n"
+            "• /limit - show remaining tokens\n"
+            "• /tokens - show remaining tokens\n"
             "• /history - show saved chats\n"
             "• /newchat - start a new chat\n"
+            "• /i \"query\" - internet search\n"
             "• /cancel - cancel current input"
         ),
-        "choose_language": "🌐 Choose interface language:",
+        "help_ai_assist_hint": "❓ If something is unclear, ask the AI assistant for help and it will guide you step by step.",
+        "internet_search_usage": "Usage: /i \"query\" (example: /i \"current time in Baku\")",
+        "internet_search_header": "🔎 Web search results:",
+        "internet_search_no_results": "⚠️ No results found. Try another query.",
+        "internet_search_failed": "⚠️ Web search failed. Try again later.",
+        "internet_search_answer_hint": "Tip: save an API key with /apikey to also get an AI summary from sources.",
+        "convert_failed": "⚠️ Could not convert time. Try another format or locations.",
+        "convert_result": "Converted time in {to_loc}: {time}",
+        "convert_day_next": "next day",
+        "convert_day_prev": "previous day",
+        "convert_day_in": "in {days} days",
+        "convert_day_ago": "{days} days earlier",
+        "choose_language": (
+            "🌐 Language center\n"
+            "Pick your interface language below.\n"
+            "✅ Current: {current}\n"
+            "🧭 Available: {total}"
+        ),
         "language_changed": "✅ Language updated: {language}",
         "choose_provider": "🤖 Choose provider:",
         "provider_changed": "✅ Provider set: {provider}",
@@ -86,6 +114,10 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
         "model_personal_api_missing_key": "⚠️ Personal API mode is enabled, but your key is missing. Use /apikey.",
         "shared_quota_exceeded": "⚠️ You reached your shared quota ({limit} tokens). Switch to Own API or wait for reset.",
+        "shared_quota_low_warning": (
+            "⚠️ Low token balance: {remaining} left.\n"
+            "To avoid interruption, switch to Own API mode or monitor usage via /limit."
+        ),
         "shared_ai_not_configured": "⚠️ Shared AI is temporarily unavailable. Contact admin.",
         "access_mode_shared": "Shared AI",
         "access_mode_personal": "Own API",
@@ -93,6 +125,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "model_llama3": "LLAMA 3",
         "model_llama4_media": "LLAMA 4 (Media)",
         "btn_own_api": "🔐 Own API",
+        "btn_use_bot_ai": "Use Bot's AI (With limits)",
         "ask_base_url": "🔗 Send API base URL (example: https://api.example.com/v1)",
         "base_url_saved": "✅ Base URL saved: {base_url}",
         "custom_base_url_required": "⚠️ Custom provider requires /baseurl before chat.",
@@ -108,6 +141,18 @@ TEXTS: dict[str, dict[str, str]] = {
             "🔐 API key: {has_key}\n"
             "🧮 Tokens left: {tokens_left}"
         ),
+        "limit_shared": (
+            "🪙 Token balance\n"
+            "{status} Shared AI quota\n"
+            "📊 Used: {used} / {limit} ({percent}%)\n"
+            "💎 Available: {remaining}\n"
+            "{bar}"
+        ),
+        "limit_personal": (
+            "🔐 Own API mode\n"
+            "🌟 Bot token quota doesn't apply here\n"
+            "🪙 Available tokens: ∞"
+        ),
         "history_cleared": "🗑️ History cleared.",
         "new_chat_started": "🆕 New chat started.",
         "new_chat_already_empty": "ℹ️ Current chat has no messages. History unchanged.",
@@ -117,8 +162,10 @@ TEXTS: dict[str, dict[str, str]] = {
         "untitled_chat": "Untitled chat",
         "processing": "⏳ Thinking...",
         "media_image_default_prompt": "Describe this image.",
-        "unsupported_media_type": "⚠️ This media type is not supported yet. Send text, photo, or image file.",
+        "unsupported_media_type": "⚠️ This media type is not supported yet. Send text, voice, video note, photo, or image file.",
         "media_too_large": "⚠️ Image is too large. Maximum size is {max_mb} MB.",
+        "voice_too_large": "⚠️ Voice message is too large. Maximum size is {max_mb} MB.",
+        "voice_transcription_failed": "⚠️ Failed to transcribe voice message. Try another voice note or provider.",
         "media_download_failed": "⚠️ Failed to download media. Please try another file.",
         "response_sent_as_image": "📷 Sent as image for better readability.",
         "error": "❌ Request failed: {error}",
@@ -133,7 +180,10 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_provider": "🤖 Provider",
         "btn_language": "🌐 Language",
         "btn_personality": "🎭 Personality",
+        "btn_internet_search": "🔎 Internet search",
+        "btn_limit": "🧮 Limit",
         "btn_custom_instructions": "🧾 Custom instructions",
+        "btn_custom_instructions_new": "➕ Add custom instructions",
         "btn_apikey": "🔐 Set API key",
         "btn_model": "🧠 Set model",
         "btn_baseurl": "🔗 Set base URL",
@@ -158,13 +208,36 @@ TEXTS: dict[str, dict[str, str]] = {
         "personality_poet": "🪶 Poet",
         "personality_philosopher": "🏛️ Philosopher",
         "personality_genius": "🧬 Genius",
+        "personality_bro": "🧢 Bro",
         "personality_manipulator": "🎭 Manipulator",
         "personality_liar": "🤥 Liar",
         "personality_historian": "📜 Historian",
         "personality_critic": "🔍 Critic",
+        "personality_mathematician": "🧮 Mathematician",
+        "personality_dushnila": "🤓 Nitpicker",
         "system_prompt": "You are a helpful AI assistant. Always answer in {language_name}.",
         "invalid_url": "⚠️ Invalid URL. Send full URL starting with http:// or https://",
         "history_item_view": "🗂️ History {current}/{total}\n{role}: {content}",
+        "custom_instructions_manage_title": "🧾 Custom instructions (edit existing):",
+        "custom_instructions_manage_empty": "🧾 You don't have custom instructions yet. Add one first.",
+        "custom_instructions_edit_actions": "🧾 Selected: {personality}\nChoose what to edit:",
+        "custom_instructions_edit_prompt": "✍️ Editing: {personality}\nSend the new instruction text in one message.",
+        "custom_instructions_rename_prompt": "🏷️ Renaming: {personality}\nSend a new personality name in one message.",
+        "custom_instructions_updated": "✅ Custom instructions updated: {personality}",
+        "custom_instructions_renamed": "✅ Custom personality renamed: {personality}",
+        "custom_instructions_current": "Current instructions:",
+        "custom_instructions_not_found": "⚠️ Custom instructions not found. It may have been removed.",
+        "btn_edit_custom_instructions_text": "✍️ Edit instruction text",
+        "btn_edit_custom_instructions_name": "🏷️ Edit personality name",
+        "btn_delete_custom_instructions": "🗑️ Delete custom instructions",
+        "btn_confirm_delete": "✅ Yes, delete",
+        "custom_instructions_delete_confirm": "🗑️ Delete {personality}? This cannot be undone.",
+        "custom_instructions_deleted": "🗑️ Deleted: {personality}",
+        "custom_instructions_delete_failed": "⚠️ Delete failed. It may have been already removed.",
+        "feature_request_contact_dev": (
+            "💡 Looks like this feature is missing right now.\n"
+            "Please message the developer in Telegram: @thebitsamurai"
+        ),
     },
     "ru": {
         "lang_name": "Русский",
@@ -174,11 +247,11 @@ TEXTS: dict[str, dict[str, str]] = {
             "🚀 Быстрый старт:\n"
             "1. Выберите провайдера\n"
             "2. Добавьте API-ключ\n"
-            "3. Начинайте диалог"
+            "3. Начинайте диалог\n\n"
+            "🌐 Интернет-поиск: используйте /i \"запрос\""
         ),
         "help": (
             "📚 Команды:\n"
-            "• /menu - открыть главное inline-меню\n"
             "• /language - выбрать язык интерфейса\n"
             "• /provider - выбрать AI-провайдера\n"
             "• /personality - выбрать личность AI\n"
@@ -187,11 +260,31 @@ TEXTS: dict[str, dict[str, str]] = {
             "• /model - задать модель\n"
             "• /baseurl - задать base URL (custom-провайдер)\n"
             "• /settings - показать настройки\n"
+            "• /limit - остаток токенов\n"
+            "• /tokens - остаток токенов\n"
             "• /history - история сохранённых чатов\n"
             "• /newchat - начать новый чат\n"
+            "• /i \"запрос\" - интернет-поиск\n"
             "• /cancel - отменить ввод"
         ),
-        "choose_language": "🌐 Выберите язык интерфейса:",
+        "help_ai_assist_hint": "❓ Если что-то непонятно или не получается, просто попросите ИИ помочь — он проведёт вас шаг за шагом.",
+        "internet_search_usage": "Использование: /i \"запрос\" (пример: /i \"время в Баку сейчас\"). Поиск выполняется на сервере бота.",
+        "internet_search_header": "🔎 Результаты интернет-поиска:",
+        "internet_search_no_results": "⚠️ Ничего не найдено. Попробуйте другой запрос.",
+        "internet_search_failed": "⚠️ Ошибка интернет-поиска. Попробуйте позже.",
+        "internet_search_answer_hint": "Подсказка: сохраните API-ключ через /apikey, чтобы бот ещё и сделал краткий ответ по источникам.",
+        "convert_failed": "⚠️ Не удалось конвертировать время. Попробуйте другой формат или города.",
+        "convert_result": "Время в {to_loc}: {time}",
+        "convert_day_next": "следующий день",
+        "convert_day_prev": "предыдущий день",
+        "convert_day_in": "через {days} дн.",
+        "convert_day_ago": "{days} дн. назад",
+        "choose_language": (
+            "🌐 Центр языков\n"
+            "Выберите язык интерфейса ниже.\n"
+            "✅ Текущий: {current}\n"
+            "🧭 Доступно: {total}"
+        ),
         "language_changed": "✅ Язык обновлён: {language}",
         "choose_provider": "🤖 Выберите провайдера:",
         "provider_changed": "✅ Провайдер установлен: {provider}",
@@ -221,6 +314,10 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
         "model_personal_api_missing_key": "⚠️ Включён режим своего API, но ключ не задан. Используйте /apikey.",
         "shared_quota_exceeded": "⚠️ Вы израсходовали лимит общего ИИ ({limit} токенов). Переключитесь на Свой API.",
+        "shared_quota_low_warning": (
+            "⚠️ У вас мало токенов: осталось {remaining}.\n"
+            "Чтобы не прерывать работу, переключитесь на Свой API или проверьте остаток через /limit."
+        ),
         "shared_ai_not_configured": "⚠️ Общий ИИ временно недоступен. Свяжитесь с админом.",
         "access_mode_shared": "Мой ИИ",
         "access_mode_personal": "Свой API",
@@ -228,6 +325,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "model_llama3": "LLAMA 3",
         "model_llama4_media": "LLAMA 4 (Media)",
         "btn_own_api": "🔐 Свой API",
+        "btn_use_bot_ai": "Use Bot's AI (With limits)",
         "ask_base_url": "🔗 Отправьте базовый URL API (пример: https://api.example.com/v1)",
         "base_url_saved": "✅ Base URL сохранён: {base_url}",
         "custom_base_url_required": "⚠️ Для custom-провайдера перед чатом нужен /baseurl.",
@@ -243,6 +341,18 @@ TEXTS: dict[str, dict[str, str]] = {
             "🔐 API-ключ: {has_key}\n"
             "🧮 Остаток токенов: {tokens_left}"
         ),
+        "limit_shared": (
+            "🪙 Баланс токенов\n"
+            "{status} Квота моего ИИ\n"
+            "📊 Использовано: {used} / {limit} ({percent}%)\n"
+            "💎 Доступно: {remaining}\n"
+            "{bar}"
+        ),
+        "limit_personal": (
+            "🔐 Режим Свой API\n"
+            "🌟 Лимит токенов бота здесь не применяется\n"
+            "🪙 Доступно токенов: ∞"
+        ),
         "history_cleared": "🗑️ История очищена.",
         "new_chat_started": "🆕 Начат новый чат.",
         "new_chat_already_empty": "ℹ️ В текущем чате нет сообщений. История не изменена.",
@@ -252,8 +362,10 @@ TEXTS: dict[str, dict[str, str]] = {
         "untitled_chat": "Без названия",
         "processing": "⏳ Думаю...",
         "media_image_default_prompt": "Опиши это изображение.",
-        "unsupported_media_type": "⚠️ Этот тип медиа пока не поддерживается. Отправьте текст, фото или файл-изображение.",
+        "unsupported_media_type": "⚠️ Этот тип медиа пока не поддерживается. Отправьте текст, голосовое, кружок, фото или файл-изображение.",
         "media_too_large": "⚠️ Изображение слишком большое. Максимальный размер: {max_mb} МБ.",
+        "voice_too_large": "⚠️ Голосовое сообщение слишком большое. Максимальный размер: {max_mb} МБ.",
+        "voice_transcription_failed": "⚠️ Не удалось распознать голосовое сообщение. Попробуйте другое голосовое или другого провайдера.",
         "media_download_failed": "⚠️ Не удалось загрузить медиа. Попробуйте другой файл.",
         "response_sent_as_image": "📷 Отправил ответ как изображение для корректного отображения.",
         "error": "❌ Ошибка запроса: {error}",
@@ -268,7 +380,10 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_provider": "🤖 Провайдер",
         "btn_language": "🌐 Язык",
         "btn_personality": "🎭 Личности",
+        "btn_internet_search": "🔎 Интернет-поиск",
+        "btn_limit": "🧮 Лимит",
         "btn_custom_instructions": "🧾 Кастомные инструкции",
+        "btn_custom_instructions_new": "➕ Добавить кастомные инструкции",
         "btn_apikey": "🔐 Задать API-ключ",
         "btn_model": "🧠 Задать модель",
         "btn_baseurl": "🔗 Задать Base URL",
@@ -293,13 +408,36 @@ TEXTS: dict[str, dict[str, str]] = {
         "personality_poet": "🪶 Поэт",
         "personality_philosopher": "🏛️ Философ",
         "personality_genius": "🧬 Гений",
+        "personality_bro": "🧢 Бро",
         "personality_manipulator": "🎭 Манипулятор",
         "personality_liar": "🤥 Лжец",
         "personality_historian": "📜 Историк",
         "personality_critic": "🔍 Критик",
+        "personality_mathematician": "🧮 Математик",
+        "personality_dushnila": "🤓 Душнила",
         "system_prompt": "Ты полезный AI-ассистент. Всегда отвечай на {language_name}.",
         "invalid_url": "⚠️ Неверный URL. Отправьте полный URL, начинающийся с http:// или https://",
         "history_item_view": "🗂️ История {current}/{total}\n{role}: {content}",
+        "custom_instructions_manage_title": "🧾 Кастомные инструкции (редактирование):",
+        "custom_instructions_manage_empty": "🧾 У вас пока нет кастомных инструкций. Сначала добавьте одну.",
+        "custom_instructions_edit_actions": "🧾 Выбрано: {personality}\nЧто изменить?",
+        "custom_instructions_edit_prompt": "✍️ Редактирование: {personality}\nОтправьте новый текст инструкции одним сообщением.",
+        "custom_instructions_rename_prompt": "🏷️ Переименование: {personality}\nОтправьте новое имя персональности одним сообщением.",
+        "custom_instructions_updated": "✅ Кастомные инструкции обновлены: {personality}",
+        "custom_instructions_renamed": "✅ Кастомная персональность переименована: {personality}",
+        "custom_instructions_current": "Текущие инструкции:",
+        "custom_instructions_not_found": "⚠️ Кастомные инструкции не найдены. Возможно, они уже удалены.",
+        "btn_edit_custom_instructions_text": "✍️ Изменить текст инструкции",
+        "btn_edit_custom_instructions_name": "🏷️ Изменить имя персональности",
+        "btn_delete_custom_instructions": "🗑️ Удалить кастомные инструкции",
+        "btn_confirm_delete": "✅ Да, удалить",
+        "custom_instructions_delete_confirm": "🗑️ Удалить {personality}? Это действие нельзя отменить.",
+        "custom_instructions_deleted": "🗑️ Удалено: {personality}",
+        "custom_instructions_delete_failed": "⚠️ Не удалось удалить. Возможно, уже удалено.",
+        "feature_request_contact_dev": (
+            "💡 Похоже, этой функции сейчас нет в боте.\n"
+            "Напишите разработчику в Telegram: @thebitsamurai"
+        ),
     },
     "es": {
         "lang_name": "Espanol",
@@ -318,9 +456,21 @@ TEXTS: dict[str, dict[str, str]] = {
             "/baseurl - definir URL base (proveedor custom)\n"
             "/settings - mostrar configuracion\n"
             "/history - mostrar historial reciente\n"
-            "/newchat - limpiar memoria/historial"
+            "/newchat - limpiar memoria/historial\n"
+            "/i \"consulta\" - busqueda en internet"
         ),
-        "choose_language": "Elige idioma:",
+        "help_ai_assist_hint": "❓ Si algo no esta claro, pide ayuda al asistente de IA y te guiara paso a paso.",
+        "internet_search_usage": "Uso: /i \"consulta\" (ejemplo: /i \"hora actual en Baku\")",
+        "internet_search_header": "🔎 Resultados de busqueda web:",
+        "internet_search_no_results": "⚠️ No se encontraron resultados. Prueba otra consulta.",
+        "internet_search_failed": "⚠️ Fallo la busqueda web. Intentalo mas tarde.",
+        "internet_search_answer_hint": "Consejo: guarda una clave con /apikey para recibir tambien un resumen con fuentes.",
+        "choose_language": (
+            "🌐 Centro de idiomas\n"
+            "Elige el idioma de la interfaz abajo.\n"
+            "✅ Actual: {current}\n"
+            "🧭 Disponibles: {total}"
+        ),
         "language_changed": "Idioma cambiado a {language}.",
         "choose_provider": "Elige proveedor:",
         "provider_changed": "Proveedor cambiado a {provider}.",
@@ -359,7 +509,15 @@ TEXTS: dict[str, dict[str, str]] = {
         "processing": "Pensando...",
         "error": "Fallo en la solicitud: {error}",
         "only_private": "Usa este bot en chat privado.",
+        "btn_settings": "⚙️ Configuracion",
+        "btn_provider": "🤖 Proveedor",
+        "btn_language": "🌐 Idioma",
         "btn_personality": "🎭 Personalidad",
+        "btn_internet_search": "🔎 Busqueda en internet",
+        "btn_limit": "🧮 Limite",
+        "btn_model": "🧠 Modelo",
+        "btn_newchat": "🆕 Nuevo chat",
+        "btn_history": "🗂️ Historial",
         "btn_custom_instructions": "🧾 Instrucciones custom",
         "personality_default": "🧩 Asistente universal",
         "personality_lawyer": "⚖️ Jurista",
@@ -378,6 +536,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "personality_liar": "🤥 Mentiroso",
         "personality_historian": "📜 Historiador",
         "personality_critic": "🔍 Critico",
+        "personality_mathematician": "🧮 Matemático",
+        "personality_dushnila": "🤓 Pedante",
         "system_prompt": "Eres un asistente de IA util. Responde siempre en {language_name}.",
         "invalid_url": "URL invalida. Envia URL completa con http:// o https://",
     },
@@ -398,9 +558,21 @@ TEXTS: dict[str, dict[str, str]] = {
             "/baseurl - definir URL de base (fournisseur custom)\n"
             "/settings - afficher les parametres\n"
             "/history - afficher l'historique recent\n"
-            "/newchat - effacer la memoire/historique"
+            "/newchat - effacer la memoire/historique\n"
+            "/i \"requete\" - recherche internet"
         ),
-        "choose_language": "Choisissez la langue:",
+        "help_ai_assist_hint": "❓ Si quelque chose n'est pas clair, demande de l'aide a l'assistant IA: il te guidera pas a pas.",
+        "internet_search_usage": "Usage: /i \"requete\" (exemple: /i \"heure actuelle a Bakou\")",
+        "internet_search_header": "🔎 Resultats de recherche web:",
+        "internet_search_no_results": "⚠️ Aucun resultat. Essayez une autre requete.",
+        "internet_search_failed": "⚠️ Echec de la recherche web. Reessayez plus tard.",
+        "internet_search_answer_hint": "Astuce: enregistrez une cle avec /apikey pour obtenir aussi un resume avec sources.",
+        "choose_language": (
+            "🌐 Centre des langues\n"
+            "Choisissez la langue de l'interface ci-dessous.\n"
+            "✅ Actuelle: {current}\n"
+            "🧭 Disponibles: {total}"
+        ),
         "language_changed": "Langue changee en {language}.",
         "choose_provider": "Choisissez le fournisseur:",
         "provider_changed": "Fournisseur defini sur {provider}.",
@@ -439,7 +611,15 @@ TEXTS: dict[str, dict[str, str]] = {
         "processing": "Reflexion...",
         "error": "Echec de la requete: {error}",
         "only_private": "Utilisez ce bot en chat prive.",
+        "btn_settings": "⚙️ Parametres",
+        "btn_provider": "🤖 Fournisseur",
+        "btn_language": "🌐 Langue",
         "btn_personality": "🎭 Personnalite",
+        "btn_internet_search": "🔎 Recherche internet",
+        "btn_limit": "🧮 Limite",
+        "btn_model": "🧠 Modele",
+        "btn_newchat": "🆕 Nouveau chat",
+        "btn_history": "🗂️ Historique",
         "btn_custom_instructions": "🧾 Instructions custom",
         "personality_default": "🧩 Assistant universel",
         "personality_lawyer": "⚖️ Juriste",
@@ -458,6 +638,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "personality_liar": "🤥 Menteur",
         "personality_historian": "📜 Historien",
         "personality_critic": "🔍 Critique",
+        "personality_mathematician": "🧮 Mathématicien",
+        "personality_dushnila": "🤓 Pedant",
         "system_prompt": "Vous etes un assistant IA utile. Repondez toujours en {language_name}.",
         "invalid_url": "URL invalide. Envoyez une URL complete commencant par http:// ou https://",
     },
@@ -478,9 +660,21 @@ TEXTS: dict[str, dict[str, str]] = {
             "/baseurl - temel URL ayarla (custom saglayici)\n"
             "/settings - ayarlari goster\n"
             "/history - son sohbet gecmisini goster\n"
-            "/newchat - hafiza/gecmisi temizle"
+            "/newchat - hafiza/gecmisi temizle\n"
+            "/i \"sorgu\" - internet aramasi"
         ),
-        "choose_language": "Dil secin:",
+        "help_ai_assist_hint": "❓ Eger bir sey net degilse, AI asistandan yardim iste; seni adim adim yonlendirecek.",
+        "internet_search_usage": "Kullanim: /i \"sorgu\" (ornek: /i \"Bakude saat kac\")",
+        "internet_search_header": "🔎 Web arama sonuclari:",
+        "internet_search_no_results": "⚠️ Sonuc bulunamadi. Baska bir sorgu deneyin.",
+        "internet_search_failed": "⚠️ Web arama basarisiz. Daha sonra tekrar deneyin.",
+        "internet_search_answer_hint": "Ipuclari: /apikey ile anahtar kaydedin, kaynaklara dayali kisa cevap da alin.",
+        "choose_language": (
+            "🌐 Dil merkezi\n"
+            "Arayuz dilini asagidan secin.\n"
+            "✅ Mevcut: {current}\n"
+            "🧭 Mevcut diller: {total}"
+        ),
         "language_changed": "Dil {language} olarak guncellendi.",
         "choose_provider": "Saglayici secin:",
         "provider_changed": "Saglayici {provider} olarak ayarlandi.",
@@ -519,7 +713,15 @@ TEXTS: dict[str, dict[str, str]] = {
         "processing": "Dusunuyor...",
         "error": "Istek hatasi: {error}",
         "only_private": "Bu botu ozel sohbette kullanin.",
+        "btn_settings": "⚙️ Ayarlar",
+        "btn_provider": "🤖 Saglayici",
+        "btn_language": "🌐 Dil",
         "btn_personality": "🎭 Kisilik",
+        "btn_internet_search": "🔎 Internet arama",
+        "btn_limit": "🧮 Limit",
+        "btn_model": "🧠 Model",
+        "btn_newchat": "🆕 Yeni sohbet",
+        "btn_history": "🗂️ Gecmis",
         "btn_custom_instructions": "🧾 Ozel talimatlar",
         "personality_default": "🧩 Evrensel asistan",
         "personality_lawyer": "⚖️ Hukukcu",
@@ -538,6 +740,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "personality_liar": "🤥 Yalanci",
         "personality_historian": "📜 Tarihci",
         "personality_critic": "🔍 Elestirmen",
+        "personality_mathematician": "🧮 Matematikçi",
+        "personality_dushnila": "🤓 Bilmis",
         "system_prompt": "Yardimci bir AI asistansiniz. Her zaman {language_name} dilinde cevap verin.",
         "invalid_url": "Gecersiz URL. http:// veya https:// ile tam URL gonderin",
     },
@@ -555,9 +759,21 @@ TEXTS: dict[str, dict[str, str]] = {
             "/baseurl - تحديد الرابط الاساسي (للمزود المخصص)\n"
             "/settings - عرض الاعدادات\n"
             "/history - عرض اخر سجل محادثة\n"
-            "/newchat - مسح الذاكرة والسجل"
+            "/newchat - مسح الذاكرة والسجل\n"
+            "/i \"استعلام\" - بحث في الانترنت"
         ),
-        "choose_language": "اختر اللغة:",
+        "help_ai_assist_hint": "❓ اذا كان شيء غير واضح، اطلب المساعدة من مساعد الذكاء الاصطناعي وسيرشدك خطوة بخطوة.",
+        "internet_search_usage": "الاستخدام: /i \"استعلام\" (مثال: /i \"الوقت الان في باكو\")",
+        "internet_search_header": "🔎 نتائج البحث على الويب:",
+        "internet_search_no_results": "⚠️ لا توجد نتائج. جرب استعلاما اخر.",
+        "internet_search_failed": "⚠️ فشل البحث على الويب. حاول لاحقا.",
+        "internet_search_answer_hint": "معلومة: احفظ مفتاح API عبر /apikey للحصول ايضا على ملخص يعتمد على المصادر.",
+        "choose_language": (
+            "🌐 مركز اللغات\n"
+            "اختر لغة الواجهة من الازرار بالاسفل.\n"
+            "✅ الحالية: {current}\n"
+            "🧭 المتاحة: {total}"
+        ),
         "language_changed": "تم تغيير اللغة الى {language}.",
         "choose_provider": "اختر المزود:",
         "provider_changed": "تم تعيين المزود الى {provider}.",
@@ -596,7 +812,15 @@ TEXTS: dict[str, dict[str, str]] = {
         "processing": "جاري التفكير...",
         "error": "فشل الطلب: {error}",
         "only_private": "استخدم البوت في محادثة خاصة.",
+        "btn_settings": "⚙️ الاعدادات",
+        "btn_provider": "🤖 المزود",
+        "btn_language": "🌐 اللغة",
         "btn_personality": "🎭 الشخصية",
+        "btn_internet_search": "🔎 بحث على الانترنت",
+        "btn_limit": "🧮 الحد",
+        "btn_model": "🧠 النموذج",
+        "btn_newchat": "🆕 دردشة جديدة",
+        "btn_history": "🗂️ السجل",
         "btn_custom_instructions": "🧾 تعليمات مخصصة",
         "personality_default": "🧩 مساعد عام",
         "personality_lawyer": "⚖️ مستشار قانوني",
@@ -615,8 +839,95 @@ TEXTS: dict[str, dict[str, str]] = {
         "personality_liar": "🤥 كاذب",
         "personality_historian": "📜 مؤرخ",
         "personality_critic": "🔍 ناقد",
+        "personality_mathematician": "🧮 رياضي",
+        "personality_dushnila": "🤓 مدقق متحذلق",
         "system_prompt": "انت مساعد ذكاء اصطناعي مفيد. اجب دائما باللغة {language_name}.",
         "invalid_url": "رابط غير صالح. ارسل رابطا كاملا يبدأ بـ http:// او https://",
+    },
+    "de": {
+        "lang_name": "Deutsch",
+        "help_ai_assist_hint": "❓ Wenn etwas unklar ist, frag den KI-Assistenten um Hilfe. Er fuehrt dich Schritt fuer Schritt.",
+        "choose_language": (
+            "🌐 Sprachzentrum\n"
+            "Waehle unten deine Interface-Sprache.\n"
+            "✅ Aktuell: {current}\n"
+            "🧭 Verfuegbar: {total}"
+        ),
+        "language_changed": "✅ Sprache aktualisiert: {language}",
+        "unsupported_language": "⚠️ Nicht unterstuetzte Sprache.",
+        "menu_title": "✨ Hauptmenue:",
+        "btn_back": "⬅️ Zurueck",
+        "btn_language": "🌐 Sprache",
+        "only_private": "🔒 Bitte nutze den Bot im privaten Chat.",
+        "system_prompt": "Du bist ein hilfreicher KI-Assistent. Antworte immer auf {language_name}.",
+    },
+    "it": {
+        "lang_name": "Italiano",
+        "help_ai_assist_hint": "❓ Se qualcosa non e chiaro, chiedi aiuto all'assistente AI: ti guidera passo dopo passo.",
+        "choose_language": (
+            "🌐 Centro lingue\n"
+            "Scegli qui sotto la lingua dell'interfaccia.\n"
+            "✅ Attuale: {current}\n"
+            "🧭 Disponibili: {total}"
+        ),
+        "language_changed": "✅ Lingua aggiornata: {language}",
+        "unsupported_language": "⚠️ Lingua non supportata.",
+        "menu_title": "✨ Menu principale:",
+        "btn_back": "⬅️ Indietro",
+        "btn_language": "🌐 Lingua",
+        "only_private": "🔒 Usa il bot nella chat privata.",
+        "system_prompt": "Sei un assistente AI utile. Rispondi sempre in {language_name}.",
+    },
+    "pt": {
+        "lang_name": "Portugues",
+        "help_ai_assist_hint": "❓ Se algo nao estiver claro, peca ajuda ao assistente de IA. Ele vai guiar voce passo a passo.",
+        "choose_language": (
+            "🌐 Centro de idiomas\n"
+            "Escolha abaixo o idioma da interface.\n"
+            "✅ Atual: {current}\n"
+            "🧭 Disponiveis: {total}"
+        ),
+        "language_changed": "✅ Idioma atualizado: {language}",
+        "unsupported_language": "⚠️ Idioma nao suportado.",
+        "menu_title": "✨ Menu principal:",
+        "btn_back": "⬅️ Voltar",
+        "btn_language": "🌐 Idioma",
+        "only_private": "🔒 Use o bot no chat privado.",
+        "system_prompt": "Voce e um assistente de IA util. Responda sempre em {language_name}.",
+    },
+    "uk": {
+        "lang_name": "Українська",
+        "help_ai_assist_hint": "❓ Якщо щось незрозуміло, попросіть AI-асистента про допомогу — він проведе вас крок за кроком.",
+        "choose_language": (
+            "🌐 Центр мов\n"
+            "Оберіть мову інтерфейсу нижче.\n"
+            "✅ Поточна: {current}\n"
+            "🧭 Доступно: {total}"
+        ),
+        "language_changed": "✅ Мову оновлено: {language}",
+        "unsupported_language": "⚠️ Непідтримувана мова.",
+        "menu_title": "✨ Головне меню:",
+        "btn_back": "⬅️ Назад",
+        "btn_language": "🌐 Мова",
+        "only_private": "🔒 Використовуйте бота в приватному чаті.",
+        "system_prompt": "Ти корисний AI-асистент. Завжди відповідай {language_name}.",
+    },
+    "hi": {
+        "lang_name": "हिन्दी",
+        "help_ai_assist_hint": "❓ अगर कुछ समझ में नहीं आए, तो AI असिस्टेंट से मदद मांगें। वह आपको कदम-दर-कदम मार्गदर्शन देगा।",
+        "choose_language": (
+            "🌐 भाषा केंद्र\n"
+            "नीचे इंटरफेस भाषा चुनें।\n"
+            "✅ वर्तमान: {current}\n"
+            "🧭 उपलब्ध: {total}"
+        ),
+        "language_changed": "✅ भाषा अपडेट हुई: {language}",
+        "unsupported_language": "⚠️ यह भाषा समर्थित नहीं है।",
+        "menu_title": "✨ मुख्य मेन्यू:",
+        "btn_back": "⬅️ वापस",
+        "btn_language": "🌐 भाषा",
+        "only_private": "🔒 कृपया बोट को निजी चैट में उपयोग करें।",
+        "system_prompt": "आप एक सहायक AI असिस्टेंट हैं। हमेशा {language_name} में उत्तर दें।",
     },
 }
 

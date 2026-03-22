@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -51,10 +52,21 @@ class Database:
         self.default_provider = default_provider
         self._fernet = Fernet(encryption_key.encode("utf-8"))
 
+    @asynccontextmanager
+    async def _connect(self):
+        conn = await aiosqlite.connect(self.db_path, timeout=30.0)
+        try:
+            await conn.execute("PRAGMA foreign_keys = ON")
+            await conn.execute("PRAGMA journal_mode = WAL")
+            await conn.execute("PRAGMA synchronous = NORMAL")
+            await conn.execute("PRAGMA busy_timeout = 30000")
+            yield conn
+        finally:
+            await conn.close()
+
     async def init(self) -> None:
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
-        async with aiosqlite.connect(self.db_path) as conn:
-            await conn.execute("PRAGMA foreign_keys = ON")
+        async with self._connect() as conn:
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS users (
@@ -144,7 +156,7 @@ class Database:
             await conn.commit()
 
     async def ensure_user(self, user_id: int) -> None:
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             await conn.execute(
                 """
                 INSERT INTO users(user_id, language, provider, model, personality, use_personal_api, quota_used)
@@ -157,7 +169,7 @@ class Database:
 
     async def get_user_settings(self, user_id: int) -> UserSettings:
         await self.ensure_user(user_id)
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             cursor = await conn.execute(
                 """
@@ -229,7 +241,7 @@ class Database:
     async def add_quota_used(self, user_id: int, delta: int) -> None:
         await self.ensure_user(user_id)
         delta_value = int(delta)
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             await conn.execute(
                 """
                 UPDATE users
@@ -257,7 +269,7 @@ class Database:
             clean_title = self._custom_personality_title(clean_instructions)
         temporary_personality_id = f"tmp_{uuid4().hex}"
 
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             cursor = await conn.execute(
                 """
                 INSERT INTO custom_personalities(user_id, personality_id, title, instructions)
@@ -284,7 +296,7 @@ class Database:
         )
 
     async def get_custom_personality(self, user_id: int, personality_id: str) -> CustomPersonality | None:
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             cursor = await conn.execute(
                 """
@@ -304,8 +316,65 @@ class Database:
             instructions=row["instructions"],
         )
 
+    async def update_custom_personality_instructions(
+        self,
+        user_id: int,
+        personality_id: str,
+        instructions: str,
+    ) -> CustomPersonality | None:
+        await self.ensure_user(user_id)
+        clean_instructions = instructions.strip()
+        if not clean_instructions:
+            raise ValueError("Instructions cannot be empty")
+
+        pid = personality_id.strip()
+        updated = 0
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE custom_personalities
+                SET instructions = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ? AND personality_id = ?
+                """,
+                (clean_instructions, user_id, pid),
+            )
+            updated = int(cursor.rowcount or 0)
+            await conn.commit()
+
+        if updated == 0:
+            return None
+        return await self.get_custom_personality(user_id, pid)
+
+    async def update_custom_personality_title(
+        self,
+        user_id: int,
+        personality_id: str,
+        title: str,
+    ) -> CustomPersonality | None:
+        await self.ensure_user(user_id)
+        clean_title = self._normalize_custom_personality_title(title)
+        if not clean_title:
+            raise ValueError("Title cannot be empty")
+
+        pid = personality_id.strip()
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE custom_personalities
+                SET title = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ? AND personality_id = ?
+                """,
+                (clean_title, user_id, pid),
+            )
+            updated = int(cursor.rowcount or 0)
+            await conn.commit()
+
+        if updated == 0:
+            return None
+        return await self.get_custom_personality(user_id, pid)
+
     async def list_custom_personalities(self, user_id: int, limit: int = 20) -> list[CustomPersonality]:
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             cursor = await conn.execute(
                 """
@@ -328,9 +397,32 @@ class Database:
             for row in rows
         ]
 
+    async def delete_custom_personality(self, user_id: int, personality_id: str) -> bool:
+        await self.ensure_user(user_id)
+        pid = personality_id.strip()
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                DELETE FROM custom_personalities
+                WHERE user_id = ? AND personality_id = ?
+                """,
+                (user_id, pid),
+            )
+            await conn.execute(
+                """
+                UPDATE users
+                SET personality = 'default', updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ? AND personality = ?
+                """,
+                (user_id, pid),
+            )
+            await conn.commit()
+
+        return int(cursor.rowcount or 0) > 0
+
     async def set_custom_base_url(self, user_id: int, base_url: str) -> None:
         await self.ensure_user(user_id)
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             await conn.execute(
                 """
                 UPDATE users
@@ -342,7 +434,7 @@ class Database:
             await conn.commit()
 
     async def _set_user_field(self, user_id: int, field: str, value: str | int) -> None:
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             await conn.execute(
                 f"UPDATE users SET {field} = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
                 (value, user_id),
@@ -352,7 +444,7 @@ class Database:
     async def set_api_key(self, user_id: int, provider: str, api_key: str) -> None:
         await self.ensure_user(user_id)
         encrypted_key = self._fernet.encrypt(api_key.encode("utf-8")).decode("utf-8")
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             await conn.execute(
                 """
                 INSERT INTO api_keys(user_id, provider, encrypted_key)
@@ -365,7 +457,7 @@ class Database:
             await conn.commit()
 
     async def get_api_key(self, user_id: int, provider: str) -> str | None:
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             cursor = await conn.execute(
                 "SELECT encrypted_key FROM api_keys WHERE user_id = ? AND provider = ?",
@@ -378,7 +470,7 @@ class Database:
         return self._fernet.decrypt(encrypted.encode("utf-8")).decode("utf-8")
 
     async def delete_api_key(self, user_id: int, provider: str) -> None:
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             await conn.execute(
                 "DELETE FROM api_keys WHERE user_id = ? AND provider = ?",
                 (user_id, provider),
@@ -386,7 +478,7 @@ class Database:
             await conn.commit()
 
     async def add_message(self, user_id: int, role: str, content: str, *, chat_id: int) -> None:
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             await conn.execute(
                 "INSERT INTO messages(user_id, chat_id, role, content) VALUES (?, ?, ?, ?)",
                 (user_id, chat_id, role, content),
@@ -401,7 +493,7 @@ class Database:
         target_chat_id = chat_id if chat_id is not None else await self.get_active_chat_id(user_id)
         if target_chat_id is None:
             return []
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             cursor = await conn.execute(
                 """
@@ -421,7 +513,7 @@ class Database:
 
     async def get_active_chat_id(self, user_id: int) -> int | None:
         await self.ensure_user(user_id)
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             cursor = await conn.execute("SELECT active_chat_id FROM users WHERE user_id = ?", (user_id,))
             row = await cursor.fetchone()
         if row is None:
@@ -430,7 +522,7 @@ class Database:
 
     async def create_chat(self, user_id: int, *, title: str = "") -> int:
         await self.ensure_user(user_id)
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             cursor = await conn.execute(
                 "INSERT INTO chats(user_id, title) VALUES (?, ?)",
                 (user_id, title.strip()),
@@ -449,7 +541,7 @@ class Database:
 
     async def set_active_chat(self, user_id: int, chat_id: int | None) -> None:
         await self.ensure_user(user_id)
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             await conn.execute(
                 """
                 UPDATE users
@@ -464,7 +556,7 @@ class Database:
         clean_title = title.strip()
         if not clean_title:
             return
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             await conn.execute(
                 """
                 UPDATE chats
@@ -476,7 +568,7 @@ class Database:
             await conn.commit()
 
     async def chat_message_count(self, user_id: int, chat_id: int) -> int:
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             cursor = await conn.execute(
                 "SELECT COUNT(*) FROM messages WHERE user_id = ? AND chat_id = ?",
                 (user_id, chat_id),
@@ -485,7 +577,7 @@ class Database:
         return int(row[0] if row else 0)
 
     async def get_recent_chats(self, user_id: int, limit: int) -> list[ChatSummary]:
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             cursor = await conn.execute(
                 """
@@ -531,7 +623,7 @@ class Database:
             return False
 
         message_count = await self.chat_message_count(user_id, active_chat_id)
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             if message_count == 0:
                 await conn.execute(
                     "DELETE FROM chats WHERE id = ? AND user_id = ?",
@@ -550,7 +642,7 @@ class Database:
 
     async def delete_chat(self, user_id: int, chat_id: int) -> None:
         await self.ensure_user(user_id)
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with self._connect() as conn:
             await conn.execute(
                 "DELETE FROM messages WHERE user_id = ? AND chat_id = ?",
                 (user_id, chat_id),

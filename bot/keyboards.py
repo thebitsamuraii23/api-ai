@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from bot.i18n import SUPPORTED_PERSONALITIES, LANGUAGE_LABELS, SUPPORTED_LANGUAGES, personality_label, t
+from bot.i18n import SUPPORTED_PERSONALITIES, LANGUAGE_LABELS, SUPPORTED_LANGUAGES, normalize_language, personality_label, t
 from bot.llm.providers import PROVIDERS, provider_label
 
 
@@ -31,13 +31,33 @@ def language_keyboard(
     with_back: bool = False,
     back_callback: str = "menu:home",
 ) -> InlineKeyboardMarkup:
+    current_lang = normalize_language(language) if language else None
+    is_ru = normalize_language(language or "en") == "ru"
     builder = InlineKeyboardBuilder()
-    for lang in SUPPORTED_LANGUAGES:
-        builder.button(text=LANGUAGE_LABELS[lang], callback_data=f"lang:{lang}")
+    layout: list[int] = []
+
+    if current_lang in LANGUAGE_LABELS:
+        current_text = LANGUAGE_LABELS[current_lang]
+        badge = f"✅ Текущий: {current_text}" if is_ru else f"✅ Current: {current_text}"
+        builder.button(text=badge, callback_data="menu:noop")
+        layout.append(1)
+
+    for lang_code in SUPPORTED_LANGUAGES:
+        prefix = "✅ " if lang_code == current_lang else "▫️ "
+        label = LANGUAGE_LABELS.get(lang_code, lang_code)
+        builder.button(text=f"{prefix}{label}", callback_data=f"lang:{lang_code}")
+
+    full_rows = len(SUPPORTED_LANGUAGES) // 2
+    layout.extend([2] * full_rows)
+    if len(SUPPORTED_LANGUAGES) % 2:
+        layout.append(1)
+
     if with_back:
-        back_label = t(language, "btn_back") if language else "⬅️ Back"
+        back_label = ("⬅️ Назад" if is_ru else "⬅️ Back") if not language else t(language, "btn_back")
         builder.button(text=back_label, callback_data=back_callback)
-    builder.adjust(2)
+        layout.append(1)
+
+    builder.adjust(*layout)
     return builder.as_markup()
 
 
@@ -71,11 +91,118 @@ def main_menu_keyboard(language: str) -> InlineKeyboardMarkup:
     builder.adjust(2, 2, 2, 2, 1)
     return builder.as_markup()
 
+def settings_keyboard(language: str) -> InlineKeyboardMarkup:
+    is_ru = normalize_language(language) == "ru"
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🤖 Модель" if is_ru else "🤖 Model", callback_data="menu:model")
+    builder.button(text="🔌 Провайдер" if is_ru else "🔌 Provider", callback_data="menu:provider")
+    builder.button(text="🎭 Роль" if is_ru else "🎭 Role", callback_data="menu:personality")
+    builder.button(text="🌐 Язык" if is_ru else "🌐 Language", callback_data="menu:language")
+    builder.button(text="🔐 API-ключ" if is_ru else "🔐 API key", callback_data="menu:apikey")
+    builder.button(text="🔗 Base URL", callback_data="menu:baseurl")
+    builder.button(text="🧾 Инструкции" if is_ru else "🧾 Instructions", callback_data="menu:custom_instructions")
+    builder.button(text="🧮 Токены" if is_ru else "🧮 Tokens", callback_data="menu:limit")
+    builder.button(text="🗂️ История" if is_ru else "🗂️ History", callback_data="menu:history:0")
+    builder.button(text="🆕 Новый чат" if is_ru else "🆕 New chat", callback_data="menu:newchat")
+    builder.button(text="🏠 Закрыть" if is_ru else "🏠 Close", callback_data="menu:home")
+    builder.adjust(2, 2, 2, 2, 2, 1)
+    return builder.as_markup()
+
+
+def reply_menu_keyboard(language: str) -> ReplyKeyboardMarkup:
+    """Постоянная reply-клавиатура с основными командами."""
+    def _label(label_key: str) -> KeyboardButton:
+        return KeyboardButton(text=t(language, label_key))
+
+    rows = [
+        [_label("btn_model"), _label("btn_internet_search")],
+        [_label("btn_history"), _label("btn_settings")],
+        [_label("btn_provider"), _label("btn_language")],
+        [_label("btn_personality"), _label("btn_newchat")],
+        [_label("btn_limit")],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        input_field_placeholder=t(language, "menu_title"),
+    )
+
+def custom_instructions_manage_keyboard(
+    *,
+    language: str,
+    custom_personalities: list[tuple[str, str]] | None = None,
+    page: int = 0,
+    page_size: int = 10,
+    with_back: bool = True,
+    back_callback: str = "menu:settings",
+) -> InlineKeyboardMarkup:
+    items = custom_personalities or []
+    builder = InlineKeyboardBuilder()
+    total_items = len(items)
+
+    if total_items == 0:
+        safe_page = 0
+        total_pages = 1
+        page_items: list[tuple[str, str]] = []
+    else:
+        total_pages = (total_items + page_size - 1) // page_size
+        safe_page = min(max(page, 0), total_pages - 1)
+        start = safe_page * page_size
+        end = start + page_size
+        page_items = items[start:end]
+
+    layout: list[int] = []
+    for personality_id, title in page_items:
+        builder.button(text=f"🧾 {title}", callback_data=f"customedit:{personality_id}")
+        layout.append(1)
+
+    if total_pages > 1:
+        nav_count = 0
+        if safe_page > 0:
+            builder.button(text="⬅️", callback_data=f"menu:custom_instructions:manage:page:{safe_page - 1}")
+            nav_count += 1
+        builder.button(text=f"{safe_page + 1}/{total_pages}", callback_data="menu:noop")
+        nav_count += 1
+        if safe_page < total_pages - 1:
+            builder.button(text="➡️", callback_data=f"menu:custom_instructions:manage:page:{safe_page + 1}")
+            nav_count += 1
+        layout.append(nav_count)
+
+    builder.button(text=t(language, "btn_custom_instructions_new"), callback_data="menu:custom_instructions:new")
+    layout.append(1)
+
+    if with_back:
+        builder.button(text=t(language, "btn_back"), callback_data=back_callback)
+        layout.append(1)
+
+    builder.adjust(*layout)
+    return builder.as_markup()
+
+
+def custom_instructions_edit_keyboard(*, language: str, personality_id: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text=t(language, "btn_edit_custom_instructions_text"), callback_data=f"customedittext:{personality_id}")
+    builder.button(text=t(language, "btn_edit_custom_instructions_name"), callback_data=f"customrename:{personality_id}")
+    builder.button(text=t(language, "btn_delete_custom_instructions"), callback_data=f"customdelete:{personality_id}")
+    builder.button(text=t(language, "btn_back"), callback_data="menu:custom_instructions:manage")
+    builder.adjust(1, 1, 1, 1)
+    return builder.as_markup()
+
+
+def custom_instructions_delete_confirm_keyboard(*, language: str, personality_id: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text=t(language, "btn_confirm_delete"), callback_data=f"customdelete_confirm:{personality_id}")
+    builder.button(text=t(language, "btn_cancel"), callback_data=f"customdelete_cancel:{personality_id}")
+    builder.adjust(1, 1)
+    return builder.as_markup()
+
 
 def personality_keyboard(
     *,
     language: str,
     custom_personalities: list[tuple[str, str]] | None = None,
+    active_personality: str | None = None,
     page: int = 0,
     page_size: int = 10,
     with_back: bool = False,
@@ -83,14 +210,19 @@ def personality_keyboard(
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
-    all_personalities: list[tuple[str, str]] = [
-        (f"personality:{personality}", personality_label(language, personality))
-        for personality in SUPPORTED_PERSONALITIES
-    ]
-    all_personalities.extend(
-        (f"personality:{personality_id}", f"🧾 {personality_title}")
-        for personality_id, personality_title in (custom_personalities or [])
-    )
+    active = (active_personality or "").strip().lower()
+    all_personalities: list[tuple[str, str]] = []
+    for personality in SUPPORTED_PERSONALITIES:
+        label = personality_label(language, personality)
+        if personality == active:
+            label = f"✅ {label}"
+        all_personalities.append((f"personality:{personality}", label))
+
+    for personality_id, personality_title in (custom_personalities or []):
+        label = f"🧾 {personality_title}"
+        if personality_id == active:
+            label = f"✅ {label}"
+        all_personalities.append((f"personality:{personality_id}", label))
 
     total_items = len(all_personalities)
     if total_items == 0:
@@ -121,7 +253,7 @@ def personality_keyboard(
             nav_count += 1
         layout.append(nav_count)
 
-    builder.button(text=t(language, "btn_custom_instructions"), callback_data="menu:custom_instructions")
+    builder.button(text=t(language, "btn_custom_instructions"), callback_data="menu:custom_instructions:manage")
     layout.append(1)
     if with_back:
         builder.button(text=t(language, "btn_back"), callback_data=back_callback)
@@ -156,6 +288,20 @@ def history_keyboard(*, language: str, page: int, total: int) -> InlineKeyboardM
 def cancel_input_keyboard(*, language: str, callback_data: str = "menu:cancel") -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text=t(language, "btn_cancel"), callback_data=callback_data)
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def sources_keyboard(*, token: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Sources", callback_data=f"sources:{token}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def use_bot_ai_keyboard(*, language: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text=t(language, "btn_use_bot_ai"), callback_data="model:use_bot_ai")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -234,27 +380,31 @@ def personality_quick_keyboard(
 ) -> InlineKeyboardMarkup:
     """Быстрый выбор личности со стандартными вариантами."""
     builder = InlineKeyboardBuilder()
-    
-    # Quick personality selection
+
+    # Quick personality selection (localized)
     quick_personalities = [
-        ("default", "🤖 Default"),
-        ("teacher", "👨‍🏫 Teacher"),
-        ("creative", "🎨 Creative"),
-        ("technical", "⚙️ Technical"),
+        "default",
+        "teacher",
+        "programmer",
+        "mathematician",
     ]
-    
-    for personality_id, label in quick_personalities:
+
+    for personality_id in quick_personalities:
+        if personality_id not in SUPPORTED_PERSONALITIES:
+            continue
         callback = f"personality:{personality_id}"
-        builder.button(text=label, callback_data=callback)
+        builder.button(text=personality_label(language, personality_id), callback_data=callback)
     
     # Custom personalities if available
     if custom_personalities:
         for personality_id, title in custom_personalities[:3]:  # Show first 3 custom
             builder.button(text=f"🧾 {title}", callback_data=f"personality:{personality_id}")
     
-    builder.button(text="📋 " + t(language, "btn_personality"), callback_data="menu:personality")
+    builder.button(text=t(language, "btn_personality"), callback_data="menu:personality")
+    builder.button(text=t(language, "btn_newchat"), callback_data="menu:newchat")
+    builder.button(text=t(language, "btn_history"), callback_data="menu:history:0")
     builder.button(text=t(language, "btn_back"), callback_data="menu:home")
-    builder.adjust(2, 2)
+    builder.adjust(2)
     return builder.as_markup()
 
 

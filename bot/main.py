@@ -35,7 +35,6 @@ async def run() -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="👋 Start bot"),
-            BotCommand(command="menu", description="✨ Open menu"),
             BotCommand(command="help", description="📚 Help"),
             BotCommand(command="language", description="🌐 Change language"),
             BotCommand(command="provider", description="🤖 Choose provider"),
@@ -45,15 +44,21 @@ async def run() -> None:
             BotCommand(command="model", description="🧠 Set model"),
             BotCommand(command="baseurl", description="🔗 Set base URL"),
             BotCommand(command="settings", description="⚙️ View settings"),
+            BotCommand(command="limit", description="🧮 Tokens left"),
+            BotCommand(command="tokens", description="🪙 Token balance"),
             BotCommand(command="history", description="🗂️ Chat history"),
             BotCommand(command="newchat", description="🆕 New chat"),
+            BotCommand(command="i", description="🌐 Internet search"),
             BotCommand(command="cancel", description="❌ Cancel input"),
         ]
     )
     dp = Dispatcher()
     dp.include_router(router)
 
-    await dp.start_polling(bot)
+    await dp.start_polling(
+        bot,
+        tasks_concurrency_limit=settings.polling_tasks_concurrency_limit,
+    )
 
 
 if __name__ == "__main__":
