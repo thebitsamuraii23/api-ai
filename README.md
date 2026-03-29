@@ -2,14 +2,11 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![aiogram](https://img.shields.io/badge/aiogram-3.x-2CA5E0?style=for-the-badge)](https://github.com/aiogram/aiogram)
-[![OpenAI SDK](https://img.shields.io/badge/OpenAI%20SDK-1.x-412991?style=for-the-badge)](https://github.com/openai/openai-python)
 [![SQLite](https://img.shields.io/badge/SQLite-3-003B57?style=for-the-badge&logo=sqlite&logoColor=white)](https://www.sqlite.org/)
-[![Encryption](https://img.shields.io/badge/API%20Keys-End--to--End%20Encrypted-0A7B34?style=for-the-badge)](#security--encryption)
+[![Privacy](https://img.shields.io/badge/API%20Keys-Session--Only%20in%20RAM-0A7B34?style=for-the-badge)](#security--encryption)
 [![Privacy Deep Dive](https://img.shields.io/badge/Privacy-PRIVACY__AND__ENCRYPTION.md-1f6feb?style=for-the-badge)](https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md)
 
-Production-ready Telegram AI bot with per-user provider settings, per-user model control, encrypted API key storage, chat history, persona switching, media support, and multilingual interface.
-
-more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md
+Production-ready Telegram AI bot with per-user provider settings, per-user model control, session-only API key handling, chat history, persona switching, media support, and multilingual interface.
 
 ## Visual Preview
 
@@ -61,17 +58,15 @@ more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_
 
 ## Security & Encryption
 
-All user API keys are handled through an end-to-end encrypted storage flow.
+UrAI now uses a `session-only` key model for user API keys.
 
-- API keys are encrypted before being persisted.
-- Encrypted values are stored in SQLite (`api_keys.encrypted_key`).
-- Decryption requires the private `DATA_ENCRYPTION_KEY` configured on your deployment.
-- The bot developer does not have access to your plaintext API keys.
-
-For encryption key generation and operational recommendations, see [`ENCRYPTION_SETUP.md`](ENCRYPTION_SETUP.md).
+- API keys are not persisted in SQLite.
+- Keys are kept in process memory only for active sessions.
+- Keys are dropped on `/deletekey`, bot restart, or session TTL expiry.
+- Historical `api_keys` table data is removed at startup.
 
 For the full privacy and data-flow deep dive:
-- more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md
+- Learn more at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md
 - in bot: use `/privacy`
 
 ## Architecture
@@ -79,16 +74,18 @@ For the full privacy and data-flow deep dive:
 - Runtime: `aiogram`-based Telegram polling bot.
 - LLM transport: OpenAI-compatible SDK abstraction (`bot/llm/service.py`).
 - Storage: SQLite with async access via `aiosqlite`.
-- Secrets protection: Fernet encryption for API keys.
+- Key handling: session-only user API keys in RAM (no DB persistence).
 - Orchestration: command handlers + callback routing in `bot/handlers.py`.
 
 ```mermaid
 flowchart LR
-    User[Telegram User] --> Bot[UrAI Bot Runtime]
-    Bot --> DB[(SQLite)]
-    Bot --> Provider[AI Provider API]
-    Key[DATA_ENCRYPTION_KEY] --> Bot
-    Bot -->|Encrypt API key (Fernet)| DB
+    U["Telegram User"] --> B["UrAI Bot Runtime"]
+    B --> D["SQLite (users/chats/messages/settings)"]
+    B --> P["AI Provider API"]
+    U --> K["/apikey input"]
+    K --> M["Session key in RAM (TTL)"]
+    M --> B
+    B -. "No API key write to DB" .-> D
 ```
 
 ## Project Structure
@@ -124,8 +121,7 @@ flowchart LR
 2. Create a virtual environment.
 3. Install dependencies.
 4. Create `.env` from `.env.example`.
-5. Generate and set `DATA_ENCRYPTION_KEY`.
-6. Start the bot.
+5. Start the bot.
 
 ### Installation
 
@@ -134,12 +130,6 @@ python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
-```
-
-### Generate Encryption Key
-
-```bash
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
 ### Run
@@ -154,7 +144,6 @@ Copy `.env.example` to `.env` and configure at least:
 
 ```env
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-DATA_ENCRYPTION_KEY=your_fernet_key
 DATABASE_PATH=data/bot.db
 DEFAULT_LANGUAGE=en
 DEFAULT_PROVIDER=openai
@@ -171,12 +160,12 @@ Important optional settings:
 ## Bot Commands
 
 - `/start` - quick onboarding and control keyboard
-- `/privacy` - detailed privacy, encryption, and data-flow overview
+- `/privacy` - detailed privacy and data-flow overview
 - `/settings` - settings hub and configuration shortcuts
 - `/languages` - switch interface language
 - `/provider` - choose provider
-- `/apikey` - save API key for active provider
-- `/deletekey` - delete API key for active provider
+- `/apikey` - set session API key for active provider
+- `/deletekey` - delete session API key for active provider
 - `/model` - set model or shared model preset
 - `/baseurl` - set custom provider base URL
 - `/personality` - select assistant persona
@@ -187,7 +176,7 @@ Important optional settings:
 - `/cancel` - exit input mode
 
 Privacy hint for users:
-- more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md
+- Learn more at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md
 
 ## Web Search Modes
 
@@ -201,7 +190,7 @@ Privacy hint for users:
 
 - Command: `/privacy`
 - Deep dive: [PRIVACY_AND_ENCRYPTION.md](PRIVACY_AND_ENCRYPTION.md)
-- more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md
+- Learn more at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md
 
 ## Development Notes
 
@@ -209,7 +198,7 @@ Privacy hint for users:
 - Core business logic lives in `bot/handlers.py`.
 - Localization fallback resolves missing keys to English.
 - The repository includes additional technical docs:
-  - `ENCRYPTION_SETUP.md`
+  - `ENCRYPTION_SETUP.md` (legacy, for historical encrypted-at-rest setup)
   - `PRIVACY_AND_ENCRYPTION.md`
   - `MARKDOWN_IMPLEMENTATION.md`
   - `MARKDOWNV2_ESCAPING_GUIDE.md`
