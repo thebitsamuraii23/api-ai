@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import html
 import json
 import mimetypes
 import re
@@ -18,6 +19,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message
+import httpx
 
 from bot.config import Settings
 from bot.db import Database, UserSettings
@@ -153,9 +155,16 @@ RESPONSE_IMAGE_MARGIN_Y = 30
 RESPONSE_IMAGE_BODY_SIZE = 28
 RESPONSE_IMAGE_HEADING_SIZE = 36
 RESPONSE_IMAGE_LINE_SPACING = 8
-RESPONSE_IMAGE_BG_COLOR = (242, 242, 242)
-RESPONSE_IMAGE_TEXT_COLOR = (18, 18, 18)
-RESPONSE_IMAGE_RULE_COLOR = (156, 156, 156)
+RESPONSE_IMAGE_BG_COLOR = (20, 23, 31)
+RESPONSE_IMAGE_TEXT_COLOR = (233, 236, 241)
+RESPONSE_IMAGE_RULE_COLOR = (83, 94, 115)
+RESPONSE_IMAGE_TABLE_BORDER_COLOR = (94, 111, 137)
+RESPONSE_IMAGE_TABLE_FILL_COLOR = (28, 32, 43)
+RESPONSE_IMAGE_TABLE_HEADER_FILL_COLOR = (40, 58, 92)
+RESPONSE_IMAGE_IMAGE_FRAME_COLOR = (67, 76, 96)
+RESPONSE_IMAGE_HIGHLIGHT_FILL_COLOR = (38, 50, 76)
+RESPONSE_IMAGE_MAX_INLINE_IMAGE_HEIGHT = 920
+RESPONSE_IMAGE_MAX_INLINE_IMAGE_BYTES = 8 * 1024 * 1024
 SUPERSCRIPT_CHAR_MAP: dict[str, str] = {
     "0": "⁰",
     "1": "¹",
@@ -759,17 +768,17 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "🔐 Приватность и безопасность: всё работает end-to-end.\n"
                 "API-ключи в базе шифруются (Fernet), plaintext ключи не хранятся.\n"
                 "🎙️🖼️ Голосовые и медиа обрабатываются через API-провайдеров в рамках запроса.\n"
-                "🛡️ Подробнее: /privacy\n"
+                "🛡️ more learn at: /privacy\n"
                 "🌍 Open-source: https://github.com/thebitsamuraii23/api-ai\n"
-                "📘 README: https://github.com/thebitsamuraii23/api-ai/blob/main/README.md"
+                "📘 more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md"
             ),
             "en": (
                 "🔐 Privacy & security: everything works end-to-end.\n"
                 "API keys are encrypted at rest (Fernet), plaintext keys are not stored.\n"
                 "🎙️🖼️ Voice and media are processed through API providers during request handling.\n"
-                "🛡️ More details: /privacy\n"
+                "🛡️ more learn at: /privacy\n"
                 "🌍 Open-source: https://github.com/thebitsamuraii23/api-ai\n"
-                "📘 README: https://github.com/thebitsamuraii23/api-ai/blob/main/README.md"
+                "📘 more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md"
             ),
         }
         privacy_note = privacy_notes.get(normalized, privacy_notes["en"])
@@ -782,7 +791,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             "ru": (
                 "🛡️ Privacy и Encryption в UrAI\n\n"
                 "UrAI полностью open-source: https://github.com/thebitsamuraii23/api-ai\n"
-                "README: https://github.com/thebitsamuraii23/api-ai/blob/main/README.md\n\n"
+                "more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md\n\n"
                 "1) Как шифруются API-ключи\n"
                 "• Ключи пользователей шифруются алгоритмом Fernet перед записью в базу.\n"
                 "• В SQLite хранится только зашифрованное значение в api_keys.encrypted_key.\n"
@@ -802,13 +811,13 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "• DATA_ENCRYPTION_KEY и другие секреты должны храниться только в переменных окружения/secret manager.\n\n"
                 "5) Прозрачность\n"
                 "• Код бота открыт: https://github.com/thebitsamuraii23/api-ai\n"
-                "• Документация: https://github.com/thebitsamuraii23/api-ai/blob/main/README.md\n"
-                "• Подробный технический документ в проекте: PRIVACY_AND_ENCRYPTION.md"
+                "• more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md\n"
+                "• Подробный технический документ: PRIVACY_AND_ENCRYPTION.md"
             ),
             "en": (
                 "🛡️ Privacy & Encryption in UrAI\n\n"
                 "UrAI is fully open-source: https://github.com/thebitsamuraii23/api-ai\n"
-                "README: https://github.com/thebitsamuraii23/api-ai/blob/main/README.md\n\n"
+                "more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md\n\n"
                 "1) How API keys are encrypted\n"
                 "• User API keys are encrypted with Fernet before DB persistence.\n"
                 "• SQLite stores only encrypted values in api_keys.encrypted_key.\n"
@@ -827,8 +836,8 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "• DATA_ENCRYPTION_KEY and other secrets should be kept in environment variables/secret manager only.\n\n"
                 "5) Transparency\n"
                 "• Open-source repository: https://github.com/thebitsamuraii23/api-ai\n"
-                "• Documentation: https://github.com/thebitsamuraii23/api-ai/blob/main/README.md\n"
-                "• Extended technical doc in this project: PRIVACY_AND_ENCRYPTION.md"
+                "• more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md\n"
+                "• Extended technical doc: PRIVACY_AND_ENCRYPTION.md"
             ),
         }
         return templates.get(normalized, templates["en"])
@@ -1070,11 +1079,15 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         )
         formatting_guardrail = (
             "Formatting: do not use LaTeX commands like \\cdot, \\frac, \\sqrt, \\begin, \\end. "
-            "Write formulas in plain text with Unicode symbols (for example: ·, ×, ÷, ≤, ≥, √)."
+            "Write formulas in plain text with Unicode symbols (for example: ·, ×, ÷, ≤, ≥, √). "
+            "Always write mathematical division using the Unicode fraction slash '⁄' (never plain '/'). "
+            "For standalone one-fraction lines, present division as a visible fraction (numerator, bar, denominator)."
         )
         presentation_guardrail = (
             "Presentation style (applies to all personalities): use Markdown formatting frequently to improve readability "
             "(short headings, bullet lists, bold highlights, and inline code when helpful). "
+            "Use visible emphasis in most non-trivial replies: highlight key terms with **bold**, and structure steps with short section headers. "
+            "When a response has 3+ sentences, prefer at least one bold highlight and one compact list. "
             "Use emojis in most replies: usually include 1 relevant emoji, sometimes 2 for longer responses. "
             "Keep emoji usage moderate (normally no more than 2, hard max 3) and avoid spam or decorative clutter."
         )
@@ -6505,12 +6518,24 @@ def _should_send_response_as_image(text: str) -> bool:
         return False
 
     lines = text.splitlines()
+    if _contains_inline_markdown_images(text):
+        return True
     if _looks_like_markdown_table(lines):
         return True
     if _contains_math_notation(text):
         return True
     if len(text) > 4000 and text.count("```") % 2 == 1:
         return True
+    return False
+
+
+def _contains_inline_markdown_images(text: str) -> bool:
+    if re.search(r"!\[[^\]]*]\((https?://[^)\s]+)\)", text):
+        return True
+    for line in text.splitlines():
+        stripped = line.strip()
+        if re.fullmatch(r"https?://\S+", stripped) and _looks_like_image_url(stripped):
+            return True
     return False
 
 
@@ -6693,8 +6718,12 @@ def _replace_math_fraction_slashes(text: str) -> str:
         if "http://" in lowered or "https://" in lowered:
             lines.append(line)
             continue
+        # Preserve command lines like /start, /privacy.
+        if line.lstrip().startswith("/") and " " not in line.strip():
+            lines.append(line)
+            continue
         if _looks_math_like_line(line):
-            line = re.sub(r"(?<=\S)\s*/\s*(?=\S)", "⁄", line)
+            line = line.replace("/", "⁄")
         lines.append(line)
     return "\n".join(lines)
 
@@ -6714,7 +6743,12 @@ async def _send_response_as_image(
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> bool:
     clean_response = _prepare_response_for_display(response)
-    pages = _render_response_text_to_jpg_pages(clean_response)
+    text_with_image_tokens, inline_image_urls = _extract_inline_image_urls_from_response(clean_response)
+    inline_images = await _fetch_inline_images_for_response(inline_image_urls)
+    pages = await _render_response_text_to_jpg_pages(
+        text_with_image_tokens,
+        inline_images=inline_images,
+    )
     if not pages:
         return False
 
@@ -6731,7 +6765,11 @@ async def _send_response_as_image(
     return True
 
 
-def _render_response_text_to_jpg_pages(text: str) -> list[BufferedInputFile]:
+async def _render_response_text_to_jpg_pages(
+    text: str,
+    *,
+    inline_images: dict[int, bytes] | None = None,
+) -> list[BufferedInputFile]:
     try:
         from PIL import Image, ImageDraw, ImageFont
     except Exception:  # noqa: BLE001
@@ -6746,11 +6784,18 @@ def _render_response_text_to_jpg_pages(text: str) -> list[BufferedInputFile]:
     measure_draw = ImageDraw.Draw(measure_canvas)
 
     normalized_text = _normalize_text_for_image(text)
+    normalized_text = _normalize_markdown_tables_for_image(normalized_text)
+    prepared_inline_images = _prepare_inline_images_for_render(
+        inline_images or {},
+        image_module=Image,
+        max_width=max_text_width,
+    )
     rows = _layout_rows_for_image(
         normalized_text,
         draw=measure_draw,
         fonts=fonts,
         max_width=max_text_width,
+        inline_images=prepared_inline_images,
     )
     if not rows:
         rows = [{"kind": "spacer", "height": 24}]
@@ -6781,8 +6826,77 @@ def _render_response_text_to_jpg_pages(text: str) -> list[BufferedInputFile]:
                     fill=RESPONSE_IMAGE_RULE_COLOR,
                     width=1,
                 )
+            elif kind == "fraction_rule":
+                x_start = RESPONSE_IMAGE_MARGIN_X + int(row.get("x_offset", 0))
+                rule_width = max(20, int(row.get("rule_width", 40)))
+                center_y = y + row_height // 2
+                draw.line(
+                    (
+                        x_start,
+                        center_y,
+                        x_start + rule_width,
+                        center_y,
+                    ),
+                    fill=RESPONSE_IMAGE_TEXT_COLOR,
+                    width=2,
+                )
+            elif kind == "inline_image":
+                image_index = int(row.get("image_index", -1))
+                inline_item = prepared_inline_images.get(image_index)
+                if inline_item and inline_item.get("image") is not None:
+                    rendered_image = inline_item["image"]
+                    img_w = int(inline_item["width"])
+                    img_h = int(inline_item["height"])
+                    x = RESPONSE_IMAGE_MARGIN_X + max(0, (max_text_width - img_w) // 2)
+                    top = y + 10
+                    draw.rectangle(
+                        (x - 2, top - 2, x + img_w + 2, top + img_h + 2),
+                        outline=RESPONSE_IMAGE_IMAGE_FRAME_COLOR,
+                        width=2,
+                    )
+                    image.paste(rendered_image, (x, top))
+                else:
+                    fallback = "[image unavailable]"
+                    draw.text(
+                        (RESPONSE_IMAGE_MARGIN_X, y + 8),
+                        fallback,
+                        font=fonts["mono"],
+                        fill=RESPONSE_IMAGE_TEXT_COLOR,
+                    )
             elif kind == "text":
                 x = RESPONSE_IMAGE_MARGIN_X + int(row.get("x_offset", 0))
+                if bool(row.get("highlight")):
+                    draw.rectangle(
+                        (
+                            RESPONSE_IMAGE_MARGIN_X,
+                            y + 1,
+                            page_width - RESPONSE_IMAGE_MARGIN_X,
+                            y + max(2, row_height - 2),
+                        ),
+                        fill=RESPONSE_IMAGE_HIGHLIGHT_FILL_COLOR,
+                    )
+                table_style = str(row.get("table_style") or "")
+                if table_style in {"header", "data"}:
+                    segments = row.get("segments") or []
+                    content_width = _segments_text_width(draw, segments, fonts)
+                    left = x - 6
+                    right = x + content_width + 6
+                    fill_color = (
+                        RESPONSE_IMAGE_TABLE_HEADER_FILL_COLOR
+                        if table_style == "header"
+                        else RESPONSE_IMAGE_TABLE_FILL_COLOR
+                    )
+                    draw.rectangle(
+                        (
+                            left,
+                            y + 1,
+                            right,
+                            y + max(2, row_height - 2),
+                        ),
+                        fill=fill_color,
+                        outline=RESPONSE_IMAGE_TABLE_BORDER_COLOR,
+                        width=1,
+                    )
                 segments = row.get("segments") or []
                 if isinstance(segments, list):
                     for segment in segments:
@@ -6818,11 +6932,199 @@ def _normalize_text_for_image(text: str) -> str:
     return cleaned.strip()
 
 
+def _normalize_markdown_tables_for_image(text: str) -> str:
+    lines = text.split("\n")
+    output: list[str] = []
+    index = 0
+
+    while index < len(lines):
+        current = lines[index]
+        next_line = lines[index + 1] if index + 1 < len(lines) else ""
+        if _is_markdown_table_header_row(current) and _is_markdown_table_separator_row(next_line):
+            table_rows: list[list[str]] = [_split_markdown_table_row(current)]
+            index += 2
+            while index < len(lines) and _is_markdown_table_header_row(lines[index]):
+                table_rows.append(_split_markdown_table_row(lines[index]))
+                index += 1
+            output.extend(_render_table_block_for_image(table_rows))
+            continue
+        output.append(current)
+        index += 1
+    return "\n".join(output)
+
+
+def _is_markdown_table_header_row(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return stripped.count("|") >= 2
+
+
+def _is_markdown_table_separator_row(line: str) -> bool:
+    return bool(re.fullmatch(r"\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*", line or ""))
+
+
+def _split_markdown_table_row(line: str) -> list[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    cells = [cell.strip() for cell in stripped.split("|")]
+    return cells
+
+
+def _render_table_block_for_image(rows: list[list[str]]) -> list[str]:
+    if not rows:
+        return []
+    col_count = max(len(row) for row in rows)
+    normalized_rows: list[list[str]] = []
+    for row in rows:
+        filled = [(_truncate_for_table(cell)) for cell in row]
+        if len(filled) < col_count:
+            filled.extend([""] * (col_count - len(filled)))
+        normalized_rows.append(filled)
+
+    widths: list[int] = []
+    for col in range(col_count):
+        widths.append(max(3, min(28, max(len(normalized_rows[row][col]) for row in range(len(normalized_rows))))))
+
+    def _border(left: str, middle: str, right: str) -> str:
+        body = middle.join("─" * (width + 2) for width in widths)
+        return f"{left}{body}{right}"
+
+    def _row(values: list[str]) -> str:
+        parts = [f" {values[idx].ljust(widths[idx])} " for idx in range(col_count)]
+        return f"│{'│'.join(parts)}│"
+
+    rendered = [_border("┌", "┬", "┐"), _row(normalized_rows[0])]
+    if len(normalized_rows) > 1:
+        rendered.append(_border("├", "┼", "┤"))
+        for value_row in normalized_rows[1:]:
+            rendered.append(_row(value_row))
+    rendered.append(_border("└", "┴", "┘"))
+    rendered.append("")
+    return rendered
+
+
+def _truncate_for_table(value: str, *, limit: int = 28) -> str:
+    text = re.sub(r"\s+", " ", value.strip())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _extract_inline_image_urls_from_response(text: str) -> tuple[str, list[str]]:
+    if not text.strip():
+        return text, []
+
+    urls: list[str] = []
+    max_inline_images = 6
+
+    def add_url(raw_url: str) -> str:
+        if len(urls) >= max_inline_images:
+            return raw_url
+        safe = html.unescape(raw_url.strip())
+        if not safe:
+            return ""
+        urls.append(safe)
+        token = f"[[INLINE_IMAGE_{len(urls) - 1}]]"
+        return token
+
+    with_markdown_tokens = re.sub(
+        r"!\[[^\]]*]\((https?://[^)\s]+)\)",
+        lambda m: add_url(m.group(1)),
+        text,
+    )
+
+    lines: list[str] = []
+    for raw_line in with_markdown_tokens.split("\n"):
+        stripped = raw_line.strip()
+        if re.fullmatch(r"https?://\S+", stripped):
+            token = add_url(stripped)
+            if token:
+                lines.append(token)
+                continue
+        lines.append(raw_line)
+
+    return "\n".join(lines), urls
+
+
+def _looks_like_image_url(url: str) -> bool:
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    path = (parsed.path or "").lower()
+    return any(path.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"))
+
+
+async def _fetch_inline_images_for_response(urls: list[str]) -> dict[int, bytes]:
+    if not urls:
+        return {}
+
+    results: dict[int, bytes] = {}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; UrAI/1.0; +https://example.invalid)"}
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
+        for index, url in enumerate(urls):
+            try:
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+            except Exception:  # noqa: BLE001
+                continue
+            content_type = (response.headers.get("content-type") or "").lower()
+            if not content_type.startswith("image/") and not _looks_like_image_url(url):
+                continue
+            payload = response.content or b""
+            if not payload or len(payload) > RESPONSE_IMAGE_MAX_INLINE_IMAGE_BYTES:
+                continue
+            results[index] = payload
+    return results
+
+
+def _prepare_inline_images_for_render(
+    inline_images: dict[int, bytes],
+    *,
+    image_module: Any,
+    max_width: int,
+) -> dict[int, dict[str, Any]]:
+    prepared: dict[int, dict[str, Any]] = {}
+    for index, payload in inline_images.items():
+        try:
+            raw = image_module.open(BytesIO(payload)).convert("RGB")
+        except Exception:  # noqa: BLE001
+            continue
+        width, height = raw.size
+        if width <= 0 or height <= 0:
+            continue
+
+        width_scale = max_width / width
+        height_scale = RESPONSE_IMAGE_MAX_INLINE_IMAGE_HEIGHT / height
+        scale = min(1.0, width_scale, height_scale)
+        resized_width = max(1, int(width * scale))
+        resized_height = max(1, int(height * scale))
+        if resized_width != width or resized_height != height:
+            try:
+                resized = raw.resize((resized_width, resized_height), image_module.Resampling.LANCZOS)
+            except Exception:  # noqa: BLE001
+                resized = raw.resize((resized_width, resized_height))
+        else:
+            resized = raw
+        prepared[index] = {
+            "image": resized,
+            "width": resized_width,
+            "height": resized_height,
+        }
+    return prepared
+
+
 def _load_render_fonts(image_font_module: Any) -> dict[str, Any]:
     regular = _load_first_available_font(
         image_font_module,
         RESPONSE_IMAGE_BODY_SIZE,
         (
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
@@ -6832,15 +7134,40 @@ def _load_render_fonts(image_font_module: Any) -> dict[str, Any]:
         image_font_module,
         RESPONSE_IMAGE_BODY_SIZE,
         (
+            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+        ),
+    )
+    italic = _load_first_available_font(
+        image_font_module,
+        RESPONSE_IMAGE_BODY_SIZE,
+        (
+            "/usr/share/fonts/truetype/noto/NotoSans-Italic.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-RI.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Italic.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ),
+    )
+    bold_italic = _load_first_available_font(
+        image_font_module,
+        RESPONSE_IMAGE_BODY_SIZE,
+        (
+            "/usr/share/fonts/truetype/noto/NotoSans-BoldItalic.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-BI.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-BoldItalic.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         ),
     )
     mono = _load_first_available_font(
         image_font_module,
         RESPONSE_IMAGE_BODY_SIZE,
         (
+            "/usr/share/fonts/truetype/jetbrains/JetBrainsMono-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -6850,26 +7177,64 @@ def _load_render_fonts(image_font_module: Any) -> dict[str, Any]:
         image_font_module,
         RESPONSE_IMAGE_BODY_SIZE,
         (
+            "/usr/share/fonts/truetype/jetbrains/JetBrainsMono-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationMono-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ),
+    )
+    serif = _load_first_available_font(
+        image_font_module,
+        RESPONSE_IMAGE_BODY_SIZE,
+        (
+            "/usr/share/fonts/truetype/noto/NotoSerif-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSerif-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         ),
     )
     heading = _load_first_available_font(
         image_font_module,
         RESPONSE_IMAGE_HEADING_SIZE,
         (
+            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ),
+    )
+    heading_alt = _load_first_available_font(
+        image_font_module,
+        RESPONSE_IMAGE_HEADING_SIZE,
+        (
+            "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSerif-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ),
+    )
+    emoji = _load_first_available_font(
+        image_font_module,
+        RESPONSE_IMAGE_BODY_SIZE,
+        (
+            "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+            "/usr/share/fonts/truetype/emoji/NotoColorEmoji.ttf",
+            "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         ),
     )
     return {
         "body": regular,
         "body_bold": bold,
+        "body_italic": italic,
+        "body_bold_italic": bold_italic,
         "mono": mono,
         "mono_bold": mono_bold,
+        "serif": serif,
         "heading": heading,
+        "heading_alt": heading_alt,
+        "emoji": emoji,
     }
 
 
@@ -6882,13 +7247,90 @@ def _load_first_available_font(image_font_module: Any, size: int, candidates: tu
     return image_font_module.load_default()
 
 
-def _layout_rows_for_image(text: str, *, draw: Any, fonts: dict[str, Any], max_width: int) -> list[dict[str, Any]]:
+def _table_line_style(line: str, *, table_open: bool, header_rendered: bool) -> tuple[str, bool, bool]:
+    stripped = line.strip()
+    if stripped.startswith("┌"):
+        return "border", True, False
+    if stripped.startswith("└"):
+        return "border", False, header_rendered
+    if stripped.startswith("├"):
+        return "border", table_open, header_rendered
+    if stripped.startswith("│"):
+        if table_open and not header_rendered:
+            return "header", table_open, True
+        return "data", table_open, header_rendered
+    return "data", table_open, header_rendered
+
+
+def _contains_emoji_chars(text: str) -> bool:
+    return any(_is_emoji_char(ch) for ch in text)
+
+
+def _is_emoji_char(ch: str) -> bool:
+    cp = ord(ch)
+    return (
+        0x1F1E6 <= cp <= 0x1F1FF  # flags
+        or 0x1F300 <= cp <= 0x1FAFF  # symbols and pictographs
+        or 0x1F600 <= cp <= 0x1F64F  # emoticons
+        or 0x2600 <= cp <= 0x27BF  # misc symbols + dingbats
+    )
+
+
+def _segments_for_image_text(text: str, base_font_key: str, *, fonts: dict[str, Any]) -> list[tuple[str, str]]:
+    value = text or ""
+    if not value:
+        return [("", base_font_key)]
+    if not _contains_emoji_chars(value):
+        return [(value, base_font_key)]
+
+    segments: list[tuple[str, str]] = []
+    buffer: list[str] = []
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        if _is_emoji_char(ch):
+            if buffer:
+                segments.append(("".join(buffer), base_font_key))
+                buffer = []
+            start = i
+            i += 1
+            while i < len(value) and (ord(value[i]) in {0xFE0E, 0xFE0F} or 0x1F3FB <= ord(value[i]) <= 0x1F3FF):
+                i += 1
+            while i + 1 < len(value) and ord(value[i]) == 0x200D and _is_emoji_char(value[i + 1]):
+                i += 2
+                while i < len(value) and (ord(value[i]) in {0xFE0E, 0xFE0F} or 0x1F3FB <= ord(value[i]) <= 0x1F3FF):
+                    i += 1
+            emoji_chunk = value[start:i]
+            emoji_font = "emoji" if "emoji" in fonts else base_font_key
+            segments.append((emoji_chunk, emoji_font))
+            continue
+        buffer.append(ch)
+        i += 1
+
+    if buffer:
+        segments.append(("".join(buffer), base_font_key))
+    return segments or [(value, base_font_key)]
+
+
+def _layout_rows_for_image(
+    text: str,
+    *,
+    draw: Any,
+    fonts: dict[str, Any],
+    max_width: int,
+    inline_images: dict[int, dict[str, Any]],
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     has_content = False
+    table_open = False
+    table_header_rendered = False
 
     for raw_line in text.split("\n"):
         line_info = _classify_image_line(raw_line)
         kind = line_info["kind"]
+        if kind != "table":
+            table_open = False
+            table_header_rendered = False
 
         if kind == "blank":
             if rows and rows[-1]["kind"] != "spacer":
@@ -6899,24 +7341,41 @@ def _layout_rows_for_image(text: str, *, draw: Any, fonts: dict[str, Any], max_w
             rows.append({"kind": "rule", "height": 26})
             continue
 
+        if kind == "inline_image":
+            image_index = int(line_info.get("image_index", -1))
+            inline_item = inline_images.get(image_index)
+            if inline_item:
+                rows.append({"kind": "spacer", "height": 10})
+                rows.append(
+                    {
+                        "kind": "inline_image",
+                        "image_index": image_index,
+                        "height": int(inline_item["height"]) + 22,
+                    }
+                )
+                rows.append({"kind": "spacer", "height": 10})
+                has_content = True
+            continue
+
         last_non_spacer = _last_non_spacer_kind(rows)
         if kind in {"heading", "section"} and has_content and last_non_spacer != "rule":
             rows.append({"kind": "rule", "height": 22})
             rows.append({"kind": "spacer", "height": 8})
 
         if kind == "heading":
-            text_line, _ = _strip_bold_markers(str(line_info["text"]))
+            text_line, _, _ = _strip_bold_markers(str(line_info["text"]))
+            heading_font_key = "heading_alt" if re.search(r"[=+\-*/^()0-9]", text_line) else "heading"
             wrapped = _wrap_text_to_width(
                 text_line,
                 draw=draw,
-                font=fonts["heading"],
+                font=fonts[heading_font_key],
                 max_width=max_width,
             )
-            row_height = _line_height_for_font(draw, fonts["heading"], extra=10)
+            row_height = _line_height_for_font(draw, fonts[heading_font_key], extra=10)
             rows.extend(
                 {
                     "kind": "text",
-                    "segments": [(line, "heading")],
+                    "segments": _segments_for_image_text(line, heading_font_key, fonts=fonts),
                     "x_offset": 0,
                     "height": row_height,
                 }
@@ -6927,20 +7386,21 @@ def _layout_rows_for_image(text: str, *, draw: Any, fonts: dict[str, Any], max_w
             continue
 
         if kind == "section":
-            text_line, _ = _strip_bold_markers(str(line_info["text"]))
+            text_line, font_key, highlight = _strip_bold_markers(str(line_info["text"]))
             wrapped = _wrap_text_to_width(
                 text_line,
                 draw=draw,
-                font=fonts["body_bold"],
+                font=fonts[font_key],
                 max_width=max_width,
             )
-            row_height = _line_height_for_font(draw, fonts["body_bold"], extra=7)
+            row_height = _line_height_for_font(draw, fonts[font_key], extra=7)
             rows.extend(
                 {
                     "kind": "text",
-                    "segments": [(line, "body_bold")],
+                    "segments": _segments_for_image_text(line, font_key, fonts=fonts),
                     "x_offset": 0,
                     "height": row_height,
+                    "highlight": highlight,
                 }
                 for line in wrapped
             )
@@ -6961,7 +7421,7 @@ def _layout_rows_for_image(text: str, *, draw: Any, fonts: dict[str, Any], max_w
             rows.extend(
                 {
                     "kind": "text",
-                    "segments": [(line, "mono")],
+                    "segments": _segments_for_image_text(line, "mono", fonts=fonts),
                     "x_offset": 10,
                     "height": row_height,
                 }
@@ -6970,9 +7430,80 @@ def _layout_rows_for_image(text: str, *, draw: Any, fonts: dict[str, Any], max_w
             has_content = True
             continue
 
+        if kind == "table":
+            table_text = str(line_info["text"])
+            table_style, table_open, table_header_rendered = _table_line_style(
+                table_text,
+                table_open=table_open,
+                header_rendered=table_header_rendered,
+            )
+            table_font_key = "mono_bold" if table_style == "header" else "mono"
+            wrapped = _wrap_text_to_width(
+                table_text,
+                draw=draw,
+                font=fonts[table_font_key],
+                max_width=max_width - 14,
+                keep_leading_spaces=True,
+            )
+            row_height = _line_height_for_font(draw, fonts[table_font_key], extra=5)
+            rows.extend(
+                {
+                    "kind": "text",
+                    "segments": _segments_for_image_text(line, table_font_key, fonts=fonts),
+                    "x_offset": 7,
+                    "height": row_height,
+                    "table_style": table_style,
+                }
+                for line in wrapped
+            )
+            has_content = True
+            continue
+
+        if kind == "fraction":
+            numerator_text, numerator_font_key, numerator_highlight = _strip_bold_markers(str(line_info["numerator"]))
+            denominator_text, denominator_font_key, denominator_highlight = _strip_bold_markers(str(line_info["denominator"]))
+            numerator_text = numerator_text.strip()
+            denominator_text = denominator_text.strip()
+            if not numerator_text or not denominator_text:
+                continue
+            num_width = _measure_text_width(draw, numerator_text, fonts[numerator_font_key])
+            den_width = _measure_text_width(draw, denominator_text, fonts[denominator_font_key])
+            bar_width = min(max_width - 12, max(24, max(num_width, den_width) + 14))
+            center_offset = max(0, (max_width - bar_width) // 2)
+            numerator_offset = center_offset + max(0, (bar_width - num_width) // 2)
+            denominator_offset = center_offset + max(0, (bar_width - den_width) // 2)
+            rows.append(
+                {
+                    "kind": "text",
+                    "segments": _segments_for_image_text(numerator_text, numerator_font_key, fonts=fonts),
+                    "x_offset": numerator_offset,
+                    "height": _line_height_for_font(draw, fonts[numerator_font_key], extra=5),
+                    "highlight": numerator_highlight,
+                }
+            )
+            rows.append(
+                {
+                    "kind": "fraction_rule",
+                    "x_offset": center_offset,
+                    "rule_width": bar_width,
+                    "height": 10,
+                }
+            )
+            rows.append(
+                {
+                    "kind": "text",
+                    "segments": _segments_for_image_text(denominator_text, denominator_font_key, fonts=fonts),
+                    "x_offset": denominator_offset,
+                    "height": _line_height_for_font(draw, fonts[denominator_font_key], extra=5),
+                    "highlight": denominator_highlight,
+                }
+            )
+            rows.append({"kind": "spacer", "height": 6})
+            has_content = True
+            continue
+
         if kind == "bullet":
-            bullet_text, bold_inline = _strip_bold_markers(str(line_info["text"]))
-            bullet_font_key = "body_bold" if bold_inline else "body"
+            bullet_text, bullet_font_key, bullet_highlight = _strip_bold_markers(str(line_info["text"]))
             text_line = f"• {bullet_text}"
             wrapped = _wrap_text_to_width(
                 text_line,
@@ -6985,9 +7516,10 @@ def _layout_rows_for_image(text: str, *, draw: Any, fonts: dict[str, Any], max_w
             rows.extend(
                 {
                     "kind": "text",
-                    "segments": [(line, bullet_font_key)],
+                    "segments": _segments_for_image_text(line, bullet_font_key, fonts=fonts),
                     "x_offset": base_indent,
                     "height": row_height,
+                    "highlight": bullet_highlight,
                 }
                 for line in wrapped
             )
@@ -6995,9 +7527,8 @@ def _layout_rows_for_image(text: str, *, draw: Any, fonts: dict[str, Any], max_w
             continue
 
         if kind == "numbered":
-            number_text, bold_inline = _strip_bold_markers(str(line_info["text"]))
+            number_text, font_key, number_highlight = _strip_bold_markers(str(line_info["text"]))
             label = str(line_info["label"])
-            font_key = "body_bold" if bold_inline else "body"
             wrapped = _wrap_text_to_width(
                 f"{label} {number_text}",
                 draw=draw,
@@ -7008,17 +7539,17 @@ def _layout_rows_for_image(text: str, *, draw: Any, fonts: dict[str, Any], max_w
             rows.extend(
                 {
                     "kind": "text",
-                    "segments": [(line, font_key)],
+                    "segments": _segments_for_image_text(line, font_key, fonts=fonts),
                     "x_offset": int(line_info.get("indent", 0)) * 4,
                     "height": row_height,
+                    "highlight": number_highlight,
                 }
                 for line in wrapped
             )
             has_content = True
             continue
 
-        paragraph_text, bold_inline = _strip_bold_markers(str(line_info["text"]))
-        paragraph_font_key = "body_bold" if bold_inline else "body"
+        paragraph_text, paragraph_font_key, paragraph_highlight = _strip_bold_markers(str(line_info["text"]))
         wrapped = _wrap_text_to_width(
             paragraph_text,
             draw=draw,
@@ -7029,9 +7560,10 @@ def _layout_rows_for_image(text: str, *, draw: Any, fonts: dict[str, Any], max_w
         rows.extend(
             {
                 "kind": "text",
-                "segments": [(line, paragraph_font_key)],
+                "segments": _segments_for_image_text(line, paragraph_font_key, fonts=fonts),
                 "x_offset": 0,
                 "height": row_height,
+                "highlight": paragraph_highlight,
             }
             for line in wrapped
         )
@@ -7047,6 +7579,10 @@ def _classify_image_line(raw_line: str) -> dict[str, Any]:
     stripped = line.strip()
     if not stripped:
         return {"kind": "blank"}
+
+    inline_image_match = re.fullmatch(r"\[\[INLINE_IMAGE_(\d+)]]", stripped)
+    if inline_image_match:
+        return {"kind": "inline_image", "image_index": int(inline_image_match.group(1))}
 
     if re.fullmatch(r"[-=_]{3,}", stripped):
         return {"kind": "rule"}
@@ -7075,10 +7611,54 @@ def _classify_image_line(raw_line: str) -> dict[str, Any]:
             "text": numbered_match.group(3),
         }
 
+    if stripped[0] in {"┌", "├", "└", "│", "┬", "┼", "┴", "╭", "╰", "╞", "╪", "╡"}:
+        return {"kind": "table", "text": line}
+
+    fraction_parts = _extract_fraction_parts_from_line(stripped)
+    if fraction_parts is not None:
+        numerator, denominator = fraction_parts
+        return {
+            "kind": "fraction",
+            "numerator": numerator,
+            "denominator": denominator,
+        }
+
     if line.startswith("    ") or re.fullmatch(r"[0-9xX+\-*/=()., ]{3,}", stripped):
         return {"kind": "mono", "text": line}
 
     return {"kind": "paragraph", "text": line}
+
+
+def _extract_fraction_parts_from_line(line: str) -> tuple[str, str] | None:
+    value = (line or "").strip()
+    if not value:
+        return None
+    lowered = value.lower()
+    if "http://" in lowered or "https://" in lowered:
+        return None
+
+    separator = "⁄" if value.count("⁄") == 1 else ("/" if value.count("/") == 1 else None)
+    if separator is None:
+        return None
+    if len(value) > 170:
+        return None
+
+    left, right = value.split(separator, maxsplit=1)
+    left = left.strip()
+    right = right.strip()
+    if not left or not right:
+        return None
+
+    if left.startswith("(") and left.endswith(")") and len(left) > 2:
+        left = left[1:-1].strip()
+    if right.startswith("(") and right.endswith(")") and len(right) > 2:
+        right = right[1:-1].strip()
+    if not left or not right:
+        return None
+
+    if len(left) > 80 or len(right) > 80:
+        return None
+    return left, right
 
 
 def _last_non_spacer_kind(rows: list[dict[str, Any]]) -> str | None:
@@ -7089,13 +7669,37 @@ def _last_non_spacer_kind(rows: list[dict[str, Any]]) -> str | None:
     return None
 
 
-def _strip_bold_markers(text: str) -> tuple[str, bool]:
+def _strip_bold_markers(text: str) -> tuple[str, str, bool]:
     normalized = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-    has_bold = bool(re.search(r"\*\*(.+?)\*\*", normalized, flags=re.DOTALL))
+    has_bold = bool(re.search(r"\*\*(.+?)\*\*|__(.+?)__", normalized, flags=re.DOTALL))
+    has_italic = bool(
+        re.search(r"(?<!\*)\*([^*]+)\*(?!\*)|(?<!_)_([^_]+)_(?!_)", normalized, flags=re.DOTALL)
+    )
+    code_spans = re.findall(r"`([^`]*)`", normalized)
+    has_inline_code = bool(code_spans)
+    is_full_inline_code = False
+    if has_inline_code:
+        compact_original = normalized.strip()
+        if len(code_spans) == 1 and compact_original == f"`{code_spans[0]}`":
+            is_full_inline_code = True
+
     normalized = re.sub(r"\*\*(.+?)\*\*", r"\1", normalized, flags=re.DOTALL)
     normalized = re.sub(r"__(.+?)__", r"\1", normalized, flags=re.DOTALL)
+    normalized = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"\1", normalized, flags=re.DOTALL)
+    normalized = re.sub(r"(?<!_)_([^_]+)_(?!_)", r"\1", normalized, flags=re.DOTALL)
+    normalized = re.sub(r"~~(.+?)~~", r"\1", normalized, flags=re.DOTALL)
     normalized = re.sub(r"`([^`]*)`", r"\1", normalized)
-    return normalized, has_bold
+
+    highlight = has_bold or bool(re.match(r"^\s*(important|note|warning|итог|важно|внимание)\b", normalized, re.I))
+    if is_full_inline_code:
+        return normalized, "mono", highlight
+    if has_bold and has_italic:
+        return normalized, "body_bold_italic", highlight
+    if has_bold:
+        return normalized, "body_bold", highlight
+    if has_italic:
+        return normalized, "body_italic", highlight
+    return normalized, "body", highlight
 
 
 def _wrap_text_to_width(
@@ -7171,6 +7775,21 @@ def _measure_text_width(draw: Any, text: str, font: Any) -> int:
         return 0
     bbox = draw.textbbox((0, 0), text, font=font)
     return max(0, bbox[2] - bbox[0])
+
+
+def _segments_text_width(draw: Any, segments: Any, fonts: dict[str, Any]) -> int:
+    if not isinstance(segments, list):
+        return 0
+    total = 0
+    for segment in segments:
+        if not isinstance(segment, tuple) or len(segment) != 2:
+            continue
+        text, font_key = segment
+        if not text:
+            continue
+        font = fonts.get(str(font_key), fonts["body"])
+        total += _measure_text_width(draw, str(text), font)
+    return total
 
 
 def _paginate_rows(rows: list[dict[str, Any]], *, max_content_height: int) -> list[list[dict[str, Any]]]:

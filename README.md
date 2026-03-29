@@ -5,8 +5,15 @@
 [![OpenAI SDK](https://img.shields.io/badge/OpenAI%20SDK-1.x-412991?style=for-the-badge)](https://github.com/openai/openai-python)
 [![SQLite](https://img.shields.io/badge/SQLite-3-003B57?style=for-the-badge&logo=sqlite&logoColor=white)](https://www.sqlite.org/)
 [![Encryption](https://img.shields.io/badge/API%20Keys-End--to--End%20Encrypted-0A7B34?style=for-the-badge)](#security--encryption)
+[![Privacy Deep Dive](https://img.shields.io/badge/Privacy-PRIVACY__AND__ENCRYPTION.md-1f6feb?style=for-the-badge)](https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md)
 
 Production-ready Telegram AI bot with per-user provider settings, per-user model control, encrypted API key storage, chat history, persona switching, media support, and multilingual interface.
+
+more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md
+
+## Visual Preview
+
+![UrAI Repository Preview](https://opengraph.githubassets.com/1/thebitsamuraii23/api-ai)
 
 ## Table of Contents
 
@@ -19,6 +26,7 @@ Production-ready Telegram AI bot with per-user provider settings, per-user model
 - [Configuration](#configuration)
 - [Bot Commands](#bot-commands)
 - [Web Search Modes](#web-search-modes)
+- [Privacy Quick Links](#privacy-quick-links)
 - [Development Notes](#development-notes)
 - [Other Projects](#other-projects)
 - [Credits](#credits)
@@ -62,6 +70,10 @@ All user API keys are handled through an end-to-end encrypted storage flow.
 
 For encryption key generation and operational recommendations, see [`ENCRYPTION_SETUP.md`](ENCRYPTION_SETUP.md).
 
+For the full privacy and data-flow deep dive:
+- more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md
+- in bot: use `/privacy`
+
 ## Architecture
 
 - Runtime: `aiogram`-based Telegram polling bot.
@@ -69,6 +81,15 @@ For encryption key generation and operational recommendations, see [`ENCRYPTION_
 - Storage: SQLite with async access via `aiosqlite`.
 - Secrets protection: Fernet encryption for API keys.
 - Orchestration: command handlers + callback routing in `bot/handlers.py`.
+
+```mermaid
+flowchart LR
+    User[Telegram User] --> Bot[UrAI Bot Runtime]
+    Bot --> DB[(SQLite)]
+    Bot --> Provider[AI Provider API]
+    Key[DATA_ENCRYPTION_KEY] --> Bot
+    Bot -->|Encrypt API key (Fernet)| DB
+```
 
 ## Project Structure
 
@@ -149,21 +170,24 @@ Important optional settings:
 
 ## Bot Commands
 
-- `/start` — quick onboarding and control keyboard
-- `/privacy` — detailed privacy, encryption, and data-flow overview
-- `/settings` — settings hub and configuration shortcuts
-- `/language` — switch interface language
-- `/provider` — choose provider
-- `/apikey` — save API key for active provider
-- `/deletekey` — delete API key for active provider
-- `/model` — set model or shared model preset
-- `/baseurl` — set custom provider base URL
-- `/personality` — select assistant persona
-- `/tokens` or `/limit` — view token status
-- `/history` — open saved chat history
-- `/newchat` — start a fresh chat context
-- `/i "query"` — internet search flow
-- `/cancel` — exit input mode
+- `/start` - quick onboarding and control keyboard
+- `/privacy` - detailed privacy, encryption, and data-flow overview
+- `/settings` - settings hub and configuration shortcuts
+- `/languages` - switch interface language
+- `/provider` - choose provider
+- `/apikey` - save API key for active provider
+- `/deletekey` - delete API key for active provider
+- `/model` - set model or shared model preset
+- `/baseurl` - set custom provider base URL
+- `/personality` - select assistant persona
+- `/tokens` or `/limit` - view token status
+- `/history` - open saved chat history
+- `/newchat` - start a fresh chat context
+- `/i "query"` - internet search flow
+- `/cancel` - exit input mode
+
+Privacy hint for users:
+- more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md
 
 ## Web Search Modes
 
@@ -172,6 +196,12 @@ Important optional settings:
 - `server`: search runs from your bot server/network
 - `openai`: search runs through OpenAI built-in tooling
 - `hybrid`: both modes available depending on runtime logic
+
+## Privacy Quick Links
+
+- Command: `/privacy`
+- Deep dive: [PRIVACY_AND_ENCRYPTION.md](PRIVACY_AND_ENCRYPTION.md)
+- more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md
 
 ## Development Notes
 
@@ -188,6 +218,8 @@ Important optional settings:
 
 - UrZen: [urzen.site](https://urzen.site)
 - Repository: [github.com/thebitsamuraii23/UrZen-player](https://github.com/thebitsamuraii23/UrZen-player)
+
+![UrZen Repository Preview](https://opengraph.githubassets.com/1/thebitsamuraii23/UrZen-player)
 
 ## Credits
 

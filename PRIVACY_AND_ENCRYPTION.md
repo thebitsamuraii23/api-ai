@@ -9,7 +9,7 @@
 This document is dedicated **only** to privacy and encryption in UrAI.
 
 - Repository: https://github.com/thebitsamuraii23/api-ai
-- README: https://github.com/thebitsamuraii23/api-ai/blob/main/README.md
+- more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md
 
 ## 1) Privacy Scope
 
@@ -161,7 +161,7 @@ flowchart TD
 UrAI is open source, so privacy/encryption behavior is auditable by anyone.
 
 - Repository: https://github.com/thebitsamuraii23/api-ai
-- README: https://github.com/thebitsamuraii23/api-ai/blob/main/README.md
+- more learn at: https://github.com/thebitsamuraii23/api-ai/blob/main/PRIVACY_AND_ENCRYPTION.md
 
 ## 12) FAQ
 
