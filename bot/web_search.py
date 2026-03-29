@@ -17,6 +17,14 @@ class WebSearchResult:
     snippet: str
 
 
+@dataclass(frozen=True, slots=True)
+class WebPageExtract:
+    source_index: int
+    title: str
+    url: str
+    text: str
+
+
 _DDG_RESULT_RE = re.compile(
     r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?'
     r'(?:<a[^>]+class="result__snippet"[^>]*>(.*?)</a>|<div[^>]+class="result__snippet"[^>]*>(.*?)</div>)',
@@ -26,6 +34,32 @@ _DDG_RESULT_RE = re.compile(
 
 def _strip_tags(value: str) -> str:
     return re.sub(r"<[^>]+>", "", value).strip()
+
+
+def _squash_whitespace(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip())
+
+
+def _clean_html_to_text(value: str) -> str:
+    text = value or ""
+    text = re.sub(r"(?is)<(script|style|noscript|template|svg|canvas|iframe)[^>]*>.*?</\1>", " ", text)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(p|div|section|article|li|h1|h2|h3|h4|h5|h6|tr)>", "\n", text)
+    text = re.sub(r"(?i)<li[^>]*>", "• ", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
+def _truncate_text(value: str, *, max_chars: int) -> str:
+    text = _squash_whitespace(value)
+    if len(text) <= max_chars:
+        return text
+    trimmed = text[: max(0, max_chars - 1)].rstrip()
+    return f"{trimmed}…"
 
 
 def _unwrap_duckduckgo_url(href: str) -> str:
@@ -157,6 +191,270 @@ def format_search_results(results: Iterable[WebSearchResult]) -> str:
     for idx, item in enumerate(items, start=1):
         snippet = f" - {item.snippet}" if item.snippet else ""
         lines.append(f"{idx}. {item.title} ({item.url}){snippet}")
+    return "\n".join(lines).strip()
+
+
+def _normalize_wiki_language(language: str | None) -> str:
+    value = (language or "").strip().lower()
+    if not value:
+        return "en"
+    aliases = {
+        "en": "en",
+        "ru": "ru",
+        "es": "es",
+        "fr": "fr",
+        "tr": "tr",
+        "ar": "ar",
+        "de": "de",
+        "it": "it",
+        "pt": "pt",
+        "uk": "uk",
+        "hi": "hi",
+    }
+    return aliases.get(value, "en")
+
+
+async def wikipedia_search(
+    query: str,
+    *,
+    max_results: int = 5,
+    timeout_s: float = 12.0,
+    language: str = "en",
+) -> list[WebSearchResult]:
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    wiki_lang = _normalize_wiki_language(language)
+    endpoint = f"https://{wiki_lang}.wikipedia.org/w/api.php"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; UrAI/1.0; +https://example.invalid)"}
+    params = {
+        "action": "query",
+        "list": "search",
+        "srsearch": q,
+        "utf8": "1",
+        "format": "json",
+        "srlimit": max(1, int(max_results)),
+    }
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout_s) as client:
+        resp = await client.get(endpoint, params=params, headers=headers)
+        resp.raise_for_status()
+        payload = resp.json()
+
+    items = ((payload or {}).get("query") or {}).get("search") or []
+    results: list[WebSearchResult] = []
+    for item in items:
+        title = str(item.get("title") or "").strip()
+        snippet_html = str(item.get("snippet") or "").strip()
+        snippet = html.unescape(_strip_tags(snippet_html))
+        if not title:
+            continue
+        article = title.replace(" ", "_")
+        url = f"https://{wiki_lang}.wikipedia.org/wiki/{article}"
+        results.append(WebSearchResult(title=title, url=url, snippet=snippet))
+        if len(results) >= max(1, int(max_results)):
+            break
+    return results
+
+
+async def github_user_search(query: str, *, max_results: int = 5, timeout_s: float = 12.0) -> list[WebSearchResult]:
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    endpoint = "https://api.github.com/search/users"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; UrAI/1.0; +https://example.invalid)",
+        "Accept": "application/vnd.github+json",
+    }
+    params = {
+        "q": f"{q} in:login",
+        "per_page": max(1, int(max_results)),
+    }
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout_s) as client:
+        resp = await client.get(endpoint, params=params, headers=headers)
+        resp.raise_for_status()
+        payload = resp.json()
+
+    results: list[WebSearchResult] = []
+    for item in (payload or {}).get("items") or []:
+        login = str(item.get("login") or "").strip()
+        url = str(item.get("html_url") or "").strip()
+        item_type = str(item.get("type") or "").strip()
+        if not login or not url:
+            continue
+        snippet = f"GitHub {item_type}".strip()
+        results.append(WebSearchResult(title=f"GitHub profile: {login}", url=url, snippet=snippet))
+        if len(results) >= max(1, int(max_results)):
+            break
+    return results
+
+
+async def gitlab_user_search(query: str, *, max_results: int = 5, timeout_s: float = 12.0) -> list[WebSearchResult]:
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    endpoint = "https://gitlab.com/api/v4/users"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; UrAI/1.0; +https://example.invalid)"}
+    params = {
+        "search": q,
+        "per_page": max(1, int(max_results)),
+    }
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout_s) as client:
+        resp = await client.get(endpoint, params=params, headers=headers)
+        resp.raise_for_status()
+        payload = resp.json()
+
+    results: list[WebSearchResult] = []
+    for item in payload or []:
+        username = str(item.get("username") or "").strip()
+        web_url = str(item.get("web_url") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if not username or not web_url:
+            continue
+        title = f"GitLab profile: {username}" if not name else f"GitLab profile: {username} ({name})"
+        results.append(WebSearchResult(title=title, url=web_url, snippet="GitLab user profile"))
+        if len(results) >= max(1, int(max_results)):
+            break
+    return results
+
+
+def _reddit_json_url(url: str) -> str:
+    safe = (url or "").strip()
+    if not safe:
+        return ""
+    parsed = urlparse(safe)
+    path = parsed.path or "/"
+    if not path.endswith(".json"):
+        if path.endswith("/"):
+            path = f"{path[:-1]}.json"
+        else:
+            path = f"{path}.json"
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{parsed.scheme or 'https'}://{parsed.netloc}{path}{query}"
+
+
+async def _fetch_reddit_extract(
+    *,
+    client: httpx.AsyncClient,
+    url: str,
+    source_index: int,
+    max_chars: int,
+) -> WebPageExtract | None:
+    json_url = _reddit_json_url(url)
+    if not json_url:
+        return None
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; UrAI/1.0; +https://example.invalid)"}
+    resp = await client.get(json_url, headers=headers)
+    resp.raise_for_status()
+    payload = resp.json()
+
+    title = ""
+    text = ""
+    if isinstance(payload, list) and payload:
+        first = payload[0] if payload else {}
+        children = (((first or {}).get("data") or {}).get("children") or []) if isinstance(first, dict) else []
+        if children and isinstance(children[0], dict):
+            data = (children[0].get("data") or {}) if isinstance(children[0], dict) else {}
+            title = str(data.get("title") or "").strip()
+            selftext = str(data.get("selftext") or "").strip()
+            text = selftext or str(data.get("subreddit_name_prefixed") or "").strip()
+
+    if not title:
+        title = "Reddit"
+    if not text:
+        text = title
+    excerpt = _truncate_text(text, max_chars=max_chars)
+    if not excerpt:
+        return None
+    return WebPageExtract(source_index=source_index, title=title, url=url, text=excerpt)
+
+
+async def _fetch_html_extract(
+    *,
+    client: httpx.AsyncClient,
+    url: str,
+    source_index: int,
+    max_chars: int,
+) -> WebPageExtract | None:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; UrAI/1.0; +https://example.invalid)",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    resp = await client.get(url, headers=headers)
+    resp.raise_for_status()
+    html_text = resp.text
+
+    title_match = re.search(r"(?is)<title[^>]*>(.*?)</title>", html_text)
+    title = _squash_whitespace(_strip_tags(title_match.group(1))) if title_match else ""
+    cleaned = _clean_html_to_text(html_text)
+    if not cleaned:
+        return None
+
+    excerpt = _truncate_text(cleaned, max_chars=max_chars)
+    if not excerpt:
+        return None
+    return WebPageExtract(
+        source_index=source_index,
+        title=title or url,
+        url=url,
+        text=excerpt,
+    )
+
+
+async def fetch_page_extracts(
+    results: Iterable[WebSearchResult],
+    *,
+    max_pages: int = 3,
+    max_chars_per_page: int = 1200,
+    timeout_s: float = 10.0,
+) -> list[WebPageExtract]:
+    items = list(results)
+    if not items:
+        return []
+    capped = items[: max(1, int(max_pages))]
+    extracts: list[WebPageExtract] = []
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout_s) as client:
+        for idx, item in enumerate(capped, start=1):
+            url = (item.url or "").strip()
+            if not url:
+                continue
+            parsed = urlparse(url)
+            host = (parsed.netloc or "").lower()
+            try:
+                if "reddit.com" in host:
+                    extract = await _fetch_reddit_extract(
+                        client=client,
+                        url=url,
+                        source_index=idx,
+                        max_chars=max_chars_per_page,
+                    )
+                else:
+                    extract = await _fetch_html_extract(
+                        client=client,
+                        url=url,
+                        source_index=idx,
+                        max_chars=max_chars_per_page,
+                    )
+            except Exception:  # noqa: BLE001
+                extract = None
+            if extract:
+                extracts.append(extract)
+    return extracts
+
+
+def format_page_extracts(extracts: Iterable[WebPageExtract]) -> str:
+    items = list(extracts)
+    if not items:
+        return ""
+    lines: list[str] = ["Fetched page excerpts:"]
+    for item in items:
+        lines.append(f"[{item.source_index}] {item.title} ({item.url})")
+        lines.append(item.text)
+        lines.append("")
     return "\n".join(lines).strip()
 
 

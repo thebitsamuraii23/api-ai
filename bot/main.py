@@ -36,7 +36,8 @@ async def run() -> None:
         [
             BotCommand(command="start", description="👋 Start bot"),
             BotCommand(command="help", description="📚 Help"),
-            BotCommand(command="language", description="🌐 Change language"),
+            BotCommand(command="privacy", description="🛡️ Privacy & encryption"),
+            BotCommand(command="languages", description="🌐 Change language"),
             BotCommand(command="provider", description="🤖 Choose provider"),
             BotCommand(command="personality", description="🎭 Choose personality"),
             BotCommand(command="apikey", description="🔐 Set API key"),

@@ -13,6 +13,7 @@ from cryptography.fernet import Fernet
 class UserSettings:
     user_id: int
     language: str
+    language_confirmed: bool
     provider: str
     model: str
     personality: str
@@ -77,6 +78,7 @@ class Database:
                     personality TEXT NOT NULL DEFAULT 'default',
                     custom_base_url TEXT,
                     active_chat_id INTEGER,
+                    language_confirmed INTEGER NOT NULL DEFAULT 0,
                     use_personal_api INTEGER NOT NULL DEFAULT 0,
                     quota_used INTEGER NOT NULL DEFAULT 0,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -88,6 +90,11 @@ class Database:
                 await conn.execute("ALTER TABLE users ADD COLUMN active_chat_id INTEGER")
             if not await self._column_exists(conn, "users", "personality"):
                 await conn.execute("ALTER TABLE users ADD COLUMN personality TEXT NOT NULL DEFAULT 'default'")
+            if not await self._column_exists(conn, "users", "language_confirmed"):
+                await conn.execute(
+                    "ALTER TABLE users ADD COLUMN language_confirmed INTEGER NOT NULL DEFAULT 0"
+                )
+                await conn.execute("UPDATE users SET language_confirmed = 1")
             if not await self._column_exists(conn, "users", "use_personal_api"):
                 await conn.execute("ALTER TABLE users ADD COLUMN use_personal_api INTEGER NOT NULL DEFAULT 0")
             if not await self._column_exists(conn, "users", "quota_used"):
@@ -159,8 +166,8 @@ class Database:
         async with self._connect() as conn:
             await conn.execute(
                 """
-                INSERT INTO users(user_id, language, provider, model, personality, use_personal_api, quota_used)
-                VALUES (?, ?, ?, '', 'default', 0, 0)
+                INSERT INTO users(user_id, language, language_confirmed, provider, model, personality, use_personal_api, quota_used)
+                VALUES (?, ?, 0, ?, 'llama4_media', 'default', 0, 0)
                 ON CONFLICT(user_id) DO NOTHING
                 """,
                 (user_id, self.default_language, self.default_provider),
@@ -176,6 +183,7 @@ class Database:
                 SELECT
                     user_id,
                     language,
+                    language_confirmed,
                     provider,
                     model,
                     personality,
@@ -193,6 +201,7 @@ class Database:
             return UserSettings(
                 user_id=user_id,
                 language=self.default_language,
+                language_confirmed=False,
                 provider=self.default_provider,
                 model="",
                 personality="default",
@@ -204,6 +213,7 @@ class Database:
         return UserSettings(
             user_id=row["user_id"],
             language=row["language"],
+            language_confirmed=bool(row["language_confirmed"]),
             provider=row["provider"],
             model=row["model"],
             personality=row["personality"] or "default",
@@ -213,9 +223,20 @@ class Database:
             quota_used=int(row["quota_used"] or 0),
         )
 
-    async def set_language(self, user_id: int, language: str) -> None:
+    async def set_language(self, user_id: int, language: str, *, confirmed: bool = True) -> None:
         await self.ensure_user(user_id)
-        await self._set_user_field(user_id, "language", language)
+        async with self._connect() as conn:
+            await conn.execute(
+                """
+                UPDATE users
+                SET language = ?,
+                    language_confirmed = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?
+                """,
+                (language, int(confirmed), user_id),
+            )
+            await conn.commit()
 
     async def set_provider(self, user_id: int, provider: str) -> None:
         await self.ensure_user(user_id)

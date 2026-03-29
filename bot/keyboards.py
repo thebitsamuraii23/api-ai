@@ -81,14 +81,12 @@ def main_menu_keyboard(language: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text=t(language, "btn_settings"), callback_data="menu:settings")
     builder.button(text=t(language, "btn_history"), callback_data="menu:history:0")
-    builder.button(text=t(language, "btn_provider"), callback_data="menu:provider")
-    builder.button(text=t(language, "btn_language"), callback_data="menu:language")
     builder.button(text=t(language, "btn_personality"), callback_data="menu:personality")
     builder.button(text=t(language, "btn_apikey"), callback_data="menu:apikey")
     builder.button(text=t(language, "btn_model"), callback_data="menu:model")
     builder.button(text=t(language, "btn_baseurl"), callback_data="menu:baseurl")
     builder.button(text=t(language, "btn_newchat"), callback_data="menu:newchat")
-    builder.adjust(2, 2, 2, 2, 1)
+    builder.adjust(2, 2, 2, 1)
     return builder.as_markup()
 
 def settings_keyboard(language: str) -> InlineKeyboardMarkup:
@@ -115,11 +113,9 @@ def reply_menu_keyboard(language: str) -> ReplyKeyboardMarkup:
         return KeyboardButton(text=t(language, label_key))
 
     rows = [
-        [_label("btn_model"), _label("btn_internet_search")],
-        [_label("btn_history"), _label("btn_settings")],
-        [_label("btn_provider"), _label("btn_language")],
-        [_label("btn_personality"), _label("btn_newchat")],
-        [_label("btn_limit")],
+        [_label("btn_model"), _label("btn_history")],
+        [_label("btn_settings"), _label("btn_personality")],
+        [_label("btn_newchat"), _label("btn_limit")],
     ]
     return ReplyKeyboardMarkup(
         keyboard=rows,
@@ -292,9 +288,16 @@ def cancel_input_keyboard(*, language: str, callback_data: str = "menu:cancel") 
     return builder.as_markup()
 
 
-def sources_keyboard(*, token: str) -> InlineKeyboardMarkup:
+def sources_keyboard(*, token: str, language: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="Sources", callback_data=f"sources:{token}")
+    builder.button(text=t(language, "btn_sources"), callback_data=f"sources:{token}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def sources_close_keyboard(*, token: str, language: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text=t(language, "btn_close_sources"), callback_data=f"sources_close:{token}")
     builder.adjust(1)
     return builder.as_markup()
 

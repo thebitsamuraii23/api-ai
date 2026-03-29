@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+import json
 import mimetypes
 import re
 import logging
+from datetime import datetime, timezone
 from uuid import uuid4
 from io import BytesIO
 from typing import Any
@@ -41,6 +43,7 @@ from bot.keyboards import (
     reply_menu_keyboard,
     provider_keyboard,
     settings_keyboard,
+    sources_close_keyboard,
     sources_keyboard,
     use_bot_ai_keyboard,
 )
@@ -49,11 +52,17 @@ from bot.llm.service import LLMService, LLMServiceError
 from bot.markdown import escape_markdown_v2, render_llm_markdown_v2
 from bot.states import SetupStates
 from bot.web_search import (
+    WebSearchResult,
     duckduckgo_search,
     duckduckgo_search_news_aware,
+    fetch_page_extracts,
     fetch_time_is_datetime,
     fetch_time_is_utc_offset,
+    format_page_extracts,
     format_search_results,
+    github_user_search,
+    gitlab_user_search,
+    wikipedia_search,
 )
 
 PERSONALITY_PROMPTS: dict[str, str] = {
@@ -80,6 +89,9 @@ PERSONALITY_PROMPTS: dict[str, str] = {
     "teacher": (
         "Role: teacher. Explain step-by-step, use short examples, and check understanding before moving to"
         " advanced detail."
+    ),
+    "mentor": (
+        "You're my ruthless mentor. Don't sugarcoat anything. If my idea is weak, call it trash and tell me why. Your job is to stress-test everything I say until it's bulletproof. Be harsher, more confrontational, and brutally direct. Avoid comforting phrases and prioritize hard criticism over politeness. In Russian, always address the user as 'ты' and never 'вы'."
     ),
     "marketer": (
         "Role: marketer. Focus on audience, value proposition, messaging angles, and measurable campaign ideas."
@@ -334,7 +346,7 @@ LATEX_COMMAND_MAP: dict[str, str] = {
     "dots": "...",
 }
 
-DEFAULT_SHARED_MODEL_ID = "llama3"
+DEFAULT_SHARED_MODEL_ID = "llama4_media"
 SHARED_MODEL_PRESETS: dict[str, dict[str, str]] = {
     "gpt4": {
         "label_key": "model_gpt4",
@@ -360,6 +372,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
     router = Router()
     logger = logging.getLogger(__name__)
     sources_cache: dict[str, str] = {}
+    sources_output_cache: dict[str, list[int]] = {}
     topic_cache: dict[tuple[int, int], str] = {}
 
     def _store_sources(text: str) -> str:
@@ -369,6 +382,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             # Drop oldest entry to limit memory growth.
             oldest = next(iter(sources_cache))
             sources_cache.pop(oldest, None)
+            sources_output_cache.pop(oldest, None)
         return token
 
     def _get_topic_hint(user_id: int, chat_id: int | None) -> str | None:
@@ -380,6 +394,147 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         if chat_id is None:
             return
         topic_cache[(user_id, chat_id)] = text
+
+    def _utc_now_stamp() -> str:
+        now_utc = datetime.now(timezone.utc)
+        return now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    def _utc_now_reply_text(lang: str) -> str:
+        stamp = _utc_now_stamp()
+        if normalize_language(lang) == "ru":
+            return f"Текущая дата и время (UTC): {stamp}"
+        return f"Current date and time (UTC): {stamp}"
+
+    def _utc_now_context_prompt() -> str:
+        return f"Current date and time (UTC): {_utc_now_stamp()}."
+
+    def _search_freshness_guardrail(query: str, *, intent: dict[str, Any]) -> str:
+        stamp = _utc_now_stamp()
+        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        kind = str(intent.get("kind") or "general")
+        wants_latest = bool(intent.get("wants_latest"))
+        if kind == "news" or wants_latest:
+            return (
+                f"Current date/time (UTC): {stamp}. "
+                f"For latest-news requests, prioritize events dated {today_utc} (UTC) using fetched page excerpts. "
+                "Extract dates from sources when possible. If no item is clearly from today (UTC), explicitly say so "
+                "and then provide the freshest available updates with their dates."
+            )
+        return f"Current date/time (UTC): {stamp}."
+
+    async def _resolve_search_query_with_llm(
+        *,
+        raw_query: str,
+        topic_hint: str,
+        lang: str,
+        provider_id: str,
+        api_key: str,
+        model: str | None,
+        custom_base_url: str | None,
+    ) -> tuple[str, bool]:
+        if not _should_try_llm_context_resolution(raw_query, topic_hint):
+            return raw_query, False
+
+        language_label = LANGUAGE_LABELS.get(lang, "English")
+        messages: list[dict[str, str]] = [
+            {
+                "role": "system",
+                "content": (
+                    "You rewrite ambiguous web search queries using conversation topic context.\n"
+                    "Rules:\n"
+                    "1) If the query is already specific and standalone, keep it unchanged.\n"
+                    "2) If the query is ambiguous or referential in any language, enrich it with concise topic terms.\n"
+                    "3) Keep the user language/script in the output.\n"
+                    "4) Output STRICT JSON only: {\"query\":\"...\",\"use_topic\":true|false}.\n"
+                    "No markdown, no explanations."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Language label: {language_label}\n"
+                    f"User query: {raw_query}\n"
+                    f"Topic hint: {topic_hint}"
+                ),
+            },
+        ]
+        try:
+            response = await llm.generate_reply(
+                provider_id=provider_id,
+                api_key=api_key,
+                model=model,
+                messages=messages,
+                custom_base_url=custom_base_url,
+                enable_web_search=False,
+                temperature=0.0,
+            )
+        except LLMServiceError:
+            return raw_query, False
+
+        rewritten_query, used_topic = _extract_query_from_llm_output(response, fallback=raw_query)
+        normalized = re.sub(r"\s+", " ", rewritten_query).strip()
+        if not normalized:
+            return raw_query, False
+        if len(normalized) > 260:
+            normalized = normalized[:260].rstrip()
+        if not normalized:
+            return raw_query, False
+        return normalized, used_topic
+
+    async def _should_auto_web_search_with_llm(
+        *,
+        raw_text: str,
+        topic_hint: str | None,
+        lang: str,
+        provider_id: str,
+        api_key: str,
+        model: str | None,
+        custom_base_url: str | None,
+    ) -> bool:
+        if not _should_try_llm_search_decision(raw_text, topic_hint):
+            return False
+
+        language_label = LANGUAGE_LABELS.get(lang, "English")
+        messages: list[dict[str, str]] = [
+            {
+                "role": "system",
+                "content": (
+                    "You decide if web search is required before answering.\n"
+                    "Return STRICT JSON only: {\"search\":true|false,\"confidence\":0..1}.\n"
+                    "Set search=true when the request depends on real-world entities/events or fresh facts:\n"
+                    "- person, organization, company, country, city, sports team, government role holder\n"
+                    "- news, recent updates, schedules, prices, rankings, scores, current status\n"
+                    "- fact-check, verification, links, citations, official sources\n"
+                    "- short follow-up confirmations like 'use it / go ahead' tied to prior topic.\n"
+                    "Set search=false for purely creative writing, translation, personal advice, or timeless explanation."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Language: {language_label}\n"
+                    f"Message: {raw_text}\n"
+                    f"Topic hint: {topic_hint or ''}"
+                ),
+            },
+        ]
+        try:
+            response = await llm.generate_reply(
+                provider_id=provider_id,
+                api_key=api_key,
+                model=model,
+                messages=messages,
+                custom_base_url=custom_base_url,
+                enable_web_search=False,
+                temperature=0.0,
+            )
+        except LLMServiceError:
+            return False
+
+        search, confidence = _extract_search_decision_from_llm_output(response)
+        if confidence is None:
+            return search
+        return search and confidence >= 0.45
 
     def _md(lang: str, key: str, **kwargs: str) -> str:
         return escape_markdown_v2(t(lang, key, **kwargs))
@@ -402,7 +557,8 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             [
                 "/start",
                 "/help",
-                "/language",
+                "/privacy",
+                "/languages",
                 "/provider",
                 "/personality",
                 "/apikey",
@@ -474,8 +630,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "3. ⚙️ Settings hub for provider, model, API key, and language (/settings).\n"
                 "4. 🗂️ Chat history and clean new chat (/history, /newchat).\n\n"
                 "🔗 UrAI repository:\n"
-                "https://github.com/thebitsamuraii23/api-ai\n\n"
-                "👨‍💻 Developer: @thebitsamurai"
+                "https://github.com/thebitsamuraii23/api-ai"
             ),
             "ru": (
                 "👋✨ Привет, {user_label}\n\n"
@@ -487,8 +642,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "3. ⚙️ Раздел настроек: провайдер, модель, API-ключ и язык (/settings).\n"
                 "4. 🗂️ История чатов и новый чистый чат (/history, /newchat).\n\n"
                 "🔗 Репозиторий UrAI:\n"
-                "https://github.com/thebitsamuraii23/api-ai\n\n"
-                "👨‍💻 Разработчик: @thebitsamurai"
+                "https://github.com/thebitsamuraii23/api-ai"
             ),
             "es": (
                 "👋✨ Hola, {user_label}\n\n"
@@ -500,8 +654,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "3. ⚙️ Centro de ajustes: proveedor, modelo, clave API e idioma (/settings).\n"
                 "4. 🗂️ Historial de chats y nuevo chat limpio (/history, /newchat).\n\n"
                 "🔗 Repositorio de UrAI:\n"
-                "https://github.com/thebitsamuraii23/api-ai\n\n"
-                "👨‍💻 Desarrollador: @thebitsamurai"
+                "https://github.com/thebitsamuraii23/api-ai"
             ),
             "fr": (
                 "👋✨ Salut, {user_label}\n\n"
@@ -513,8 +666,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "3. ⚙️ Hub des parametres: fournisseur, modele, cle API et langue (/settings).\n"
                 "4. 🗂️ Historique des chats et nouveau chat propre (/history, /newchat).\n\n"
                 "🔗 Depot UrAI:\n"
-                "https://github.com/thebitsamuraii23/api-ai\n\n"
-                "👨‍💻 Developpeur: @thebitsamurai"
+                "https://github.com/thebitsamuraii23/api-ai"
             ),
             "tr": (
                 "👋✨ Merhaba, {user_label}\n\n"
@@ -526,8 +678,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "3. ⚙️ Ayarlar merkezi: saglayici, model, API anahtari ve dil (/settings).\n"
                 "4. 🗂️ Sohbet gecmisi ve temiz yeni sohbet (/history, /newchat).\n\n"
                 "🔗 UrAI deposu:\n"
-                "https://github.com/thebitsamuraii23/api-ai\n\n"
-                "👨‍💻 Gelistirici: @thebitsamurai"
+                "https://github.com/thebitsamuraii23/api-ai"
             ),
             "ar": (
                 "👋✨ مرحبا {user_label}\n\n"
@@ -539,8 +690,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "3. ⚙️ مركز الاعدادات: المزود، النموذج، مفتاح API، واللغة (/settings).\n"
                 "4. 🗂️ سجل المحادثات وبدء محادثة جديدة نظيفة (/history, /newchat).\n\n"
                 "🔗 مستودع UrAI:\n"
-                "https://github.com/thebitsamuraii23/api-ai\n\n"
-                "👨‍💻 المطور: @thebitsamurai"
+                "https://github.com/thebitsamuraii23/api-ai"
             ),
             "de": (
                 "👋✨ Hallo, {user_label}\n\n"
@@ -552,8 +702,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "3. ⚙️ Einstellungszentrum: Anbieter, Modell, API-Key und Sprache (/settings).\n"
                 "4. 🗂️ Chatverlauf und neuer sauberer Chat (/history, /newchat).\n\n"
                 "🔗 UrAI-Repository:\n"
-                "https://github.com/thebitsamuraii23/api-ai\n\n"
-                "👨‍💻 Entwickler: @thebitsamurai"
+                "https://github.com/thebitsamuraii23/api-ai"
             ),
             "it": (
                 "👋✨ Ciao, {user_label}\n\n"
@@ -565,8 +714,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "3. ⚙️ Centro impostazioni: provider, modello, chiave API e lingua (/settings).\n"
                 "4. 🗂️ Cronologia chat e nuova chat pulita (/history, /newchat).\n\n"
                 "🔗 Repository UrAI:\n"
-                "https://github.com/thebitsamuraii23/api-ai\n\n"
-                "👨‍💻 Sviluppatore: @thebitsamurai"
+                "https://github.com/thebitsamuraii23/api-ai"
             ),
             "pt": (
                 "👋✨ Ola, {user_label}\n\n"
@@ -578,8 +726,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "3. ⚙️ Centro de configuracoes: provedor, modelo, chave API e idioma (/settings).\n"
                 "4. 🗂️ Historico de chats e novo chat limpo (/history, /newchat).\n\n"
                 "🔗 Repositorio do UrAI:\n"
-                "https://github.com/thebitsamuraii23/api-ai\n\n"
-                "👨‍💻 Desenvolvedor: @thebitsamurai"
+                "https://github.com/thebitsamuraii23/api-ai"
             ),
             "uk": (
                 "👋✨ Привіт, {user_label}\n\n"
@@ -591,8 +738,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "3. ⚙️ Центр налаштувань: провайдер, модель, API-ключ і мова (/settings).\n"
                 "4. 🗂️ Історія чатів і новий чистий чат (/history, /newchat).\n\n"
                 "🔗 Репозиторій UrAI:\n"
-                "https://github.com/thebitsamuraii23/api-ai\n\n"
-                "👨‍💻 Розробник: @thebitsamurai"
+                "https://github.com/thebitsamuraii23/api-ai"
             ),
             "hi": (
                 "👋✨ नमस्ते, {user_label}\n\n"
@@ -604,12 +750,126 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "3. ⚙️ Settings hub: provider, model, API key और language (/settings)।\n"
                 "4. 🗂️ Chat history और नया clean chat (/history, /newchat)।\n\n"
                 "🔗 UrAI repository:\n"
-                "https://github.com/thebitsamuraii23/api-ai\n\n"
-                "👨‍💻 Developer: @thebitsamurai"
+                "https://github.com/thebitsamuraii23/api-ai"
             ),
         }
         template = templates.get(normalized, templates["en"])
-        return template.format(user_label=user_label)
+        privacy_notes: dict[str, str] = {
+            "ru": (
+                "🔐 Приватность и безопасность: всё работает end-to-end.\n"
+                "API-ключи в базе шифруются (Fernet), plaintext ключи не хранятся.\n"
+                "🎙️🖼️ Голосовые и медиа обрабатываются через API-провайдеров в рамках запроса.\n"
+                "🛡️ Подробнее: /privacy\n"
+                "🌍 Open-source: https://github.com/thebitsamuraii23/api-ai\n"
+                "📘 README: https://github.com/thebitsamuraii23/api-ai/blob/main/README.md"
+            ),
+            "en": (
+                "🔐 Privacy & security: everything works end-to-end.\n"
+                "API keys are encrypted at rest (Fernet), plaintext keys are not stored.\n"
+                "🎙️🖼️ Voice and media are processed through API providers during request handling.\n"
+                "🛡️ More details: /privacy\n"
+                "🌍 Open-source: https://github.com/thebitsamuraii23/api-ai\n"
+                "📘 README: https://github.com/thebitsamuraii23/api-ai/blob/main/README.md"
+            ),
+        }
+        privacy_note = privacy_notes.get(normalized, privacy_notes["en"])
+        footer = "developed by @thebitsamurai, UrZen"
+        return f"{template.format(user_label=user_label)}\n\n{privacy_note}\n\n{footer}"
+
+    def _privacy_text(lang: str) -> str:
+        normalized = normalize_language(lang)
+        templates: dict[str, str] = {
+            "ru": (
+                "🛡️ Privacy и Encryption в UrAI\n\n"
+                "UrAI полностью open-source: https://github.com/thebitsamuraii23/api-ai\n"
+                "README: https://github.com/thebitsamuraii23/api-ai/blob/main/README.md\n\n"
+                "1) Как шифруются API-ключи\n"
+                "• Ключи пользователей шифруются алгоритмом Fernet перед записью в базу.\n"
+                "• В SQLite хранится только зашифрованное значение в api_keys.encrypted_key.\n"
+                "• Для расшифровки нужен DATA_ENCRYPTION_KEY из окружения сервера.\n"
+                "• Без корректного DATA_ENCRYPTION_KEY прочитать API-ключи невозможно.\n\n"
+                "2) Как работает API-поток\n"
+                "• Сообщение пользователя обрабатывается ботом и отправляется в выбранный AI-провайдер через API.\n"
+                "• При режиме Shared AI используется общий ключ сервера; при Own API используется ваш ключ.\n"
+                "• Разработчик не видит ваши plaintext API-ключи в базе: они хранятся в зашифрованном виде.\n\n"
+                "3) Что с сообщениями, медиа и логами\n"
+                "• История чата хранится в БД для работы контекста и истории диалогов.\n"
+                "• По умолчанию технические логи пишут метаданные (id пользователя, модель, режим поиска, ошибки), "
+                "а не полный текст сообщений.\n"
+                "• Голосовые и медиа обрабатываются через API-провайдеров в рамках текущего запроса.\n\n"
+                "4) Безопасность сервера (операционная часть)\n"
+                "• Защита сервера зависит от среды деплоя: обновления ОС, контроль доступа, защита секретов и мониторинг.\n"
+                "• DATA_ENCRYPTION_KEY и другие секреты должны храниться только в переменных окружения/secret manager.\n\n"
+                "5) Прозрачность\n"
+                "• Код бота открыт: https://github.com/thebitsamuraii23/api-ai\n"
+                "• Документация: https://github.com/thebitsamuraii23/api-ai/blob/main/README.md\n"
+                "• Подробный технический документ в проекте: PRIVACY_AND_ENCRYPTION.md"
+            ),
+            "en": (
+                "🛡️ Privacy & Encryption in UrAI\n\n"
+                "UrAI is fully open-source: https://github.com/thebitsamuraii23/api-ai\n"
+                "README: https://github.com/thebitsamuraii23/api-ai/blob/main/README.md\n\n"
+                "1) How API keys are encrypted\n"
+                "• User API keys are encrypted with Fernet before DB persistence.\n"
+                "• SQLite stores only encrypted values in api_keys.encrypted_key.\n"
+                "• Decryption requires DATA_ENCRYPTION_KEY from server environment.\n"
+                "• Without the correct DATA_ENCRYPTION_KEY, plaintext API keys cannot be recovered.\n\n"
+                "2) API data flow\n"
+                "• User input is processed by the bot and sent to the selected AI provider API.\n"
+                "• Shared AI mode uses server shared key; Own API mode uses the user key.\n"
+                "• The developer does not see plaintext API keys in DB because they are stored encrypted.\n\n"
+                "3) Messages, media, and logs\n"
+                "• Chat history is stored in DB to support context and history features.\n"
+                "• By default, technical logs store metadata (user id, model, search mode, errors), not full message text.\n"
+                "• Voice/media are processed through provider APIs during request handling.\n\n"
+                "4) Server security operations\n"
+                "• Server hardening depends on deployment environment: OS updates, access controls, secret handling, monitoring.\n"
+                "• DATA_ENCRYPTION_KEY and other secrets should be kept in environment variables/secret manager only.\n\n"
+                "5) Transparency\n"
+                "• Open-source repository: https://github.com/thebitsamuraii23/api-ai\n"
+                "• Documentation: https://github.com/thebitsamuraii23/api-ai/blob/main/README.md\n"
+                "• Extended technical doc in this project: PRIVACY_AND_ENCRYPTION.md"
+            ),
+        }
+        return templates.get(normalized, templates["en"])
+
+    def _privacy_reference_for_llm(lang: str) -> str:
+        normalized = normalize_language(lang)
+        templates: dict[str, str] = {
+            "ru": (
+                "Privacy reference (same core facts as /privacy):\n"
+                "1) API-ключи: шифруются Fernet перед записью в БД; в SQLite хранится только encrypted_key; "
+                "расшифровка требует DATA_ENCRYPTION_KEY.\n"
+                "2) Поток данных: запрос пользователя уходит в выбранный AI API; Shared AI использует серверный ключ, "
+                "Own API использует ключ пользователя.\n"
+                "3) Сообщения/медиа/логи: история чата хранится для контекста и history; голос/медиа обрабатываются "
+                "через API-провайдеров в рамках запроса; технические логи по умолчанию про метаданные, не про полный текст.\n"
+                "4) Операционная безопасность: защита зависит от деплоя (доступы, обновления, хранение секретов, мониторинг);\n"
+                "секреты, включая DATA_ENCRYPTION_KEY, должны храниться в env/secret manager.\n"
+                "5) Прозрачность: проект open-source, код и документы публичны, расширенный техдок: "
+                "PRIVACY_AND_ENCRYPTION.md."
+            ),
+            "en": (
+                "Privacy reference (same core facts as /privacy):\n"
+                "1) API keys: encrypted with Fernet before DB write; SQLite stores encrypted_key only; "
+                "decryption requires DATA_ENCRYPTION_KEY.\n"
+                "2) Data flow: user input is sent to selected AI provider API; Shared AI uses server shared key, "
+                "Own API uses user key.\n"
+                "3) Messages/media/logs: chat history is stored for context/history features; voice/media are processed "
+                "through provider APIs during the request; technical logs default to metadata, not full message text.\n"
+                "4) Operational security: protection depends on deployment hardening (access control, updates, "
+                "secret handling, monitoring); secrets including DATA_ENCRYPTION_KEY must stay in env/secret manager.\n"
+                "5) Transparency: project is open-source, code/docs are public, extended technical doc: "
+                "PRIVACY_AND_ENCRYPTION.md."
+            ),
+        }
+        return templates.get(normalized, templates["en"])
+
+    def _apikey_prompt_text(lang: str, provider: str) -> str:
+        base = t(lang, "ask_api_key", provider=provider)
+        privacy_reminder = t(lang, "apikey_privacy_reminder")
+        cancel_hint = t(lang, "apikey_cancel_hint")
+        return escape_markdown_v2(f"{base}\n\n{privacy_reminder}\n{cancel_hint}")
 
     def _render_limit_text(*, user: UserSettings, lang: str) -> str:
         if user.use_personal_api:
@@ -659,38 +919,76 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
 
         personality = await _personality_name(user_id, lang, user.personality)
         if normalize_language(lang) == "ru":
+            mode_hint = (
+                "🔐 Сейчас активен режим Свой API: можно использовать собственный ключ и любую совместимую модель."
+                if user.use_personal_api
+                else "🤖 Сейчас активен режим Мой ИИ: работает общий ключ бота и действует лимит токенов."
+            )
+            tokens_refresh_hint = (
+                "🗓️ В режиме Мой ИИ лимит токенов обновляется каждый месяц."
+                if user.use_personal_api
+                else "🗓️ Лимит токенов Мой ИИ обновляется каждый месяц."
+            )
             text = (
                 "⚙️ Раздел настроек\n\n"
-                "Здесь можно быстро настроить работу бота:\n"
-                "1. Выбрать модель и режим API.\n"
-                "2. Выбрать роль ассистента.\n"
-                "3. Настроить провайдера и API-ключ.\n"
+                "Здесь собраны все ключевые параметры бота в одном месте.\n"
+                "Вы можете быстро переключить режим работы и сразу продолжить диалог без лишних шагов.\n\n"
+                "Что можно сделать:\n"
+                "1. Выбрать модель и режим API (Мой ИИ / Свой API).\n"
+                "2. Выбрать роль ассистента и стиль ответов.\n"
+                "3. Настроить провайдера, API-ключ и base URL.\n"
                 "4. Изменить язык интерфейса.\n"
-                "5. Открыть историю и начать новый чат.\n\n"
+                "5. Открыть историю или начать новый чистый чат.\n\n"
+                "Быстрые действия:\n"
+                "• /model — смена модели\n"
+                "• /provider — выбор провайдера\n"
+                "• /apikey — подключить свой API-ключ\n"
+                "• /languages — смена языка\n\n"
                 "Текущая конфигурация:\n"
                 f"• 🌐 Язык: {language_label}\n"
                 f"• 🛂 Режим: {mode_label}\n"
                 f"• 🤖 Провайдер: {provider}\n"
                 f"• 🧠 Модель: {model}\n"
                 f"• 🎭 Роль: {personality}\n"
-                f"• 🪙 Токены: {tokens_left}"
+                f"• 🪙 Токены: {tokens_left}\n\n"
+                f"{mode_hint}\n"
+                f"{tokens_refresh_hint}"
             )
         else:
+            mode_hint = (
+                "🔐 Own API mode is active: you can use your own key and any compatible model."
+                if user.use_personal_api
+                else "🤖 Shared AI mode is active: the bot's shared key is used and token quota applies."
+            )
+            tokens_refresh_hint = (
+                "🗓️ Shared AI token quota resets every month."
+                if user.use_personal_api
+                else "🗓️ Shared AI token quota resets every month."
+            )
             text = (
                 "⚙️ Settings Hub\n\n"
-                "You can quickly tune the bot here:\n"
-                "1. Pick model and API mode.\n"
-                "2. Choose assistant role.\n"
-                "3. Configure provider and API key.\n"
+                "All key bot controls are gathered here in one place.\n"
+                "You can switch setup quickly and continue chatting right away.\n\n"
+                "What you can do:\n"
+                "1. Pick model and API mode (Shared AI / Own API).\n"
+                "2. Choose assistant role and response style.\n"
+                "3. Configure provider, API key, and base URL.\n"
                 "4. Change interface language.\n"
                 "5. Open history or start a clean chat.\n\n"
+                "Quick actions:\n"
+                "• /model — switch model\n"
+                "• /provider — choose provider\n"
+                "• /apikey — connect your own API key\n"
+                "• /languages — change language\n\n"
                 "Current setup:\n"
                 f"• 🌐 Language: {language_label}\n"
                 f"• 🛂 Mode: {mode_label}\n"
                 f"• 🤖 Provider: {provider}\n"
                 f"• 🧠 Model: {model}\n"
                 f"• 🎭 Role: {personality}\n"
-                f"• 🪙 Tokens: {tokens_left}"
+                f"• 🪙 Tokens: {tokens_left}\n\n"
+                f"{mode_hint}\n"
+                f"{tokens_refresh_hint}"
             )
         return escape_markdown_v2(text), lang
 
@@ -759,17 +1057,26 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         lang: str,
         personality: str,
         enable_web_search: bool,
+        media_hints_enabled: bool = False,
+        response_lang: str | None = None,
         user_mention: str | None = None,
         user_name: str | None = None,
     ) -> str:
+        effective_lang = normalize_language(response_lang or lang)
         base_prompt = t(
-            lang,
+            effective_lang,
             "system_prompt",
-            language_name=LANGUAGE_LABELS.get(lang, "English"),
+            language_name=LANGUAGE_LABELS.get(effective_lang, "English"),
         )
         formatting_guardrail = (
             "Formatting: do not use LaTeX commands like \\cdot, \\frac, \\sqrt, \\begin, \\end. "
             "Write formulas in plain text with Unicode symbols (for example: ·, ×, ÷, ≤, ≥, √)."
+        )
+        presentation_guardrail = (
+            "Presentation style (applies to all personalities): use Markdown formatting frequently to improve readability "
+            "(short headings, bullet lists, bold highlights, and inline code when helpful). "
+            "Use emojis in most replies: usually include 1 relevant emoji, sometimes 2 for longer responses. "
+            "Keep emoji usage moderate (normally no more than 2, hard max 3) and avoid spam or decorative clutter."
         )
         identity_guardrail = (
             "Identity and project facts (applies to all personalities): you are an AI assistant working inside the "
@@ -785,7 +1092,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         )
         models_guardrail = (
             "Shared AI models policy (applies to all personalities): if the user asks what models are available in the "
-            "bot, state clearly that Shared AI has exactly 3 models: GPT 4, LLAMA 3, and LLAMA 4 (Media support). "
+            "bot, state clearly that Shared AI has exactly 3 models: GPT 4, LLaMA 3, and LLaMA 4 (Media support). "
             "Mention model details only when the user asks about models/features."
         )
         clean_mention = (user_mention or "").strip() or "the user"
@@ -813,9 +1120,32 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             "paths in Telegram UI. Prefer actionable instructions over generic advice, and stay with the user until the "
             "task is resolved."
         )
+        media_assist_guardrail = (
+            "Media-assist policy (only when LLaMA 4 is active): mention media support proactively when the user asks "
+            "about bot capabilities. In normal replies, do not push media by default. "
+            "If the request is too long, ambiguous, or hard to parse, suggest one concise option for better understanding: "
+            "send a voice message, image/screenshot, or relevant file. "
+            "When you suggest media, also mention briefly: developer has no access to user voice/media, processing uses API keys, and data flow is end-to-end."
+            if media_hints_enabled
+            else
+            "Media-assist policy: do not proactively advertise media support in normal replies."
+        )
+        privacy_reference = _privacy_reference_for_llm(effective_lang)
+        privacy_guardrail = (
+            "Privacy policy (applies to all personalities): if the user asks about privacy, security, data handling, "
+            "or access to messages/voice/media/files, answer with the same core facts as /privacy and keep facts strict. "
+            "Adapt tone/style to the active personality, but do not change technical facts. "
+            "Always mention that detailed full info is available via /privacy. "
+            f"{privacy_reference}"
+        )
         feature_feedback_guardrail = (
             "If the user says some feature is missing/not available in the bot (feature request/complaint), "
             "politely suggest contacting the developer in Telegram: @thebitsamurai."
+        )
+        relevance_guardrail = (
+            "Relevance policy (applies to all personalities): answer only what the user asked. "
+            "Do not add unrelated trivia, side stories, analogies, or pop-culture comparisons unless explicitly requested. "
+            "For direct factual questions, start with a short direct answer, then add only essential supporting facts."
         )
         extra_guardrails: list[str] = []
         if enable_web_search:
@@ -830,12 +1160,16 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 lines = [
                     base_prompt,
                     formatting_guardrail,
+                    presentation_guardrail,
                     identity_guardrail,
                     models_guardrail,
                     personalization_guardrail,
                     capabilities_guardrail,
                     bot_guide_guardrail,
+                    media_assist_guardrail,
+                    privacy_guardrail,
                     feature_feedback_guardrail,
+                    relevance_guardrail,
                     *extra_guardrails,
                 ]
                 lines.append("Role: custom persona from user instructions.")
@@ -847,12 +1181,16 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             [
                 base_prompt,
                 formatting_guardrail,
+                presentation_guardrail,
                 identity_guardrail,
                 models_guardrail,
                 personalization_guardrail,
                 capabilities_guardrail,
                 bot_guide_guardrail,
+                media_assist_guardrail,
+                privacy_guardrail,
                 feature_feedback_guardrail,
+                relevance_guardrail,
                 *extra_guardrails,
                 personality_prompt,
             ]
@@ -932,6 +1270,145 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         title = item.title.strip() or t(lang, "untitled_chat")
         return item.chat_id, lang, safe_page, total, title
 
+    def _recent_assistant_reply_preview(history: list[dict[str, Any]], *, max_chars: int = 420) -> str | None:
+        for item in reversed(history):
+            if not isinstance(item, dict) or item.get("role") != "assistant":
+                continue
+            text = _extract_text_from_message_content(item.get("content"))
+            if not text:
+                continue
+            compact = re.sub(r"\s+", " ", text).strip()
+            if not compact:
+                continue
+            return compact[:max_chars]
+        return None
+
+    def _recent_media_marker(history: list[dict[str, Any]], *, skip_text: str | None = None) -> str | None:
+        for item in reversed(history):
+            if not isinstance(item, dict) or item.get("role") != "user":
+                continue
+            content = item.get("content")
+            text = _extract_text_from_message_content(content)
+            if skip_text and text.strip().lower() == skip_text.strip().lower():
+                continue
+            lowered = text.strip().lower()
+            if lowered.startswith("[image"):
+                return "image"
+            if lowered.startswith("[voice"):
+                return "voice"
+            if lowered.startswith("[video_note"):
+                return "video_note"
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        return "image"
+        return None
+
+    def _conversation_continuity_prompt(
+        *,
+        raw_text: str,
+        history: list[dict[str, Any]],
+        topic_hint: str | None,
+    ) -> str | None:
+        if not _looks_like_context_dependent_followup(raw_text):
+            return None
+        prev_assistant = _recent_assistant_reply_preview(history)
+        media_marker = _recent_media_marker(history, skip_text=raw_text)
+        if not prev_assistant and not topic_hint and not media_marker:
+            return None
+
+        lines = [
+            "Conversation continuity: the latest user message is a follow-up to previous turns.",
+            "Treat it as continuation unless the user clearly switches topic.",
+            "If the user challenges earlier output (for example: 'you sure?'), verify/correct previous claims instead of resetting context.",
+        ]
+        if topic_hint:
+            lines.append(f"Topic hint: {topic_hint}")
+        if media_marker:
+            lines.append(
+                "Recent media context exists in this chat "
+                f"({media_marker}); it was already processed earlier in this conversation."
+            )
+        if prev_assistant:
+            lines.append(f"Previous assistant answer to reference: {prev_assistant}")
+        return "\n".join(lines)
+
+    def _build_chat_context(
+        *,
+        system_prompt: str,
+        history: list[dict[str, Any]],
+        raw_text: str,
+        topic_hint: str | None,
+        wants_models_answer: bool,
+        wants_capabilities_answer: bool,
+        wants_guided_help: bool,
+        message_id: int,
+        media_hints_enabled: bool,
+    ) -> list[dict[str, Any]]:
+        context: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "system",
+                "content": _utc_now_context_prompt(),
+            },
+            *history,
+        ]
+        continuity_prompt = _conversation_continuity_prompt(
+            raw_text=raw_text,
+            history=history,
+            topic_hint=topic_hint,
+        )
+        if continuity_prompt:
+            context.insert(
+                1,
+                {
+                    "role": "system",
+                    "content": continuity_prompt,
+                },
+            )
+        if wants_models_answer:
+            context.insert(
+                1,
+                {
+                    "role": "system",
+                    "content": _shared_models_prompt_for_message(message_id),
+                },
+            )
+        if wants_capabilities_answer:
+            context.insert(
+                1,
+                {
+                    "role": "system",
+                    "content": _capabilities_prompt_for_message(
+                        message_id,
+                        media_hints_enabled=media_hints_enabled,
+                    ),
+                },
+            )
+        if wants_guided_help:
+            context.insert(
+                1,
+                {
+                    "role": "system",
+                    "content": _bot_help_mode_prompt_for_message(message_id),
+                },
+            )
+        if topic_hint and _looks_like_context_dependent_followup(raw_text):
+            context.insert(
+                1,
+                {
+                    "role": "system",
+                    "content": (
+                        f"Conversation topic hint: {topic_hint}\n"
+                        "Treat the latest user message as a follow-up to this topic unless the user clearly switches topic."
+                    ),
+                },
+            )
+        return context
+
     async def _safe_edit(query: CallbackQuery, text: str, *, lang: str, include_menu: bool = True) -> None:
         if not query.message:
             return
@@ -947,13 +1424,21 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             return
         await state.clear()
         await db.ensure_user(message.from_user.id)
-        lang = await _user_lang(message.from_user.id)
+        user = await db.get_user_settings(message.from_user.id)
+        lang = user.language
         if await _deny_if_not_private(message, lang):
             return
-        await state.set_state(SetupStates.waiting_start_language)
+        if not user.language_confirmed:
+            await state.set_state(SetupStates.waiting_start_language)
+            await message.answer(
+                escape_markdown_v2(_start_language_picker_text()),
+                reply_markup=language_keyboard(language=None, with_back=False),
+                parse_mode="MarkdownV2",
+            )
+            return
         await message.answer(
-            escape_markdown_v2(_start_language_picker_text()),
-            reply_markup=language_keyboard(language=None, with_back=False),
+            escape_markdown_v2(_start_guide_text(lang, user_label=_start_user_label(message))),
+            reply_markup=reply_menu_keyboard(lang),
             parse_mode="MarkdownV2",
         )
 
@@ -966,13 +1451,33 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             return
         help_text = _md(lang, "help")
         help_hint = _md(lang, "help_ai_assist_hint")
-        combined_help = f"{help_text}\n\n{help_hint}"
+        privacy_help_hints: dict[str, str] = {
+            "ru": "🛡️ Подробно про privacy/encryption: /privacy",
+            "en": "🛡️ Detailed privacy/encryption info: /privacy",
+        }
+        privacy_help_hint = escape_markdown_v2(
+            privacy_help_hints.get(normalize_language(lang), privacy_help_hints["en"])
+        )
+        combined_help = f"{help_text}\n\n{help_hint}\n{privacy_help_hint}"
         await message.answer(
             combined_help,
             reply_markup=reply_menu_keyboard(lang),
             parse_mode="MarkdownV2",
         )
         await _show_menu(message, lang)
+
+    @router.message(Command("privacy"))
+    async def on_privacy(message: Message) -> None:
+        if message.from_user is None:
+            return
+        lang = await _user_lang(message.from_user.id)
+        if await _deny_if_not_private(message, lang):
+            return
+        await message.answer(
+            escape_markdown_v2(_privacy_text(lang)),
+            reply_markup=reply_menu_keyboard(lang),
+            parse_mode="MarkdownV2",
+        )
 
     @router.message(Command("i"))
     async def on_internet_search(message: Message, command: CommandObject) -> None:
@@ -987,13 +1492,18 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         raw_query = (command.args or "").strip() if command else ""
         query = raw_query.strip().strip("\"'").strip()
         query = _strip_label_arg(query, lang=lang, label_key="btn_internet_search")
-        if _is_generic_search_phrase(query) or not query:
+        topic_hint = _get_topic_hint(message.from_user.id, user.active_chat_id)
+        if (
+            _is_generic_search_phrase(query)
+            or _looks_like_search_execution_confirmation(query)
+            or (_search_target_domain_from_intent(query) is not None and topic_hint is not None)
+            or not query
+        ):
             history = await db.get_recent_messages(
                 message.from_user.id,
                 settings.memory_messages,
                 chat_id=user.active_chat_id,
             )
-            topic_hint = _get_topic_hint(message.from_user.id, user.active_chat_id)
             resolved_query, topic = _resolve_search_query(query or "search it", history, topic_hint=topic_hint)
             if topic:
                 query = resolved_query
@@ -1004,11 +1514,57 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 parse_mode="MarkdownV2",
             )
             return
+        query_intent = _parse_search_intent(query, topic_hint=topic_hint, lang=lang)
+        reply_lang = _detect_reply_language(query, fallback_lang=lang)
+        clarification = _search_clarification_prompt(query, lang=lang, intent=query_intent, topic_hint=topic_hint)
+        if clarification:
+            await message.answer(
+                escape_markdown_v2(clarification),
+                reply_markup=main_menu_keyboard(lang),
+                parse_mode="MarkdownV2",
+            )
+            return
+
+        # Resolve provider/key early so we can optionally rewrite ambiguous queries in any language.
+        provider_id = user.provider
+        custom_base_url = user.custom_base_url
+        api_key: str | None = None
+        selected_model = user.model
+
+        if user.use_personal_api:
+            api_key = await db.get_api_key(message.from_user.id, provider_id)
+            if provider_id == "custom" and not custom_base_url:
+                api_key = None
+            selected_model = (selected_model or PROVIDERS.get(provider_id, PROVIDERS["openai"]).default_model).strip()
+        else:
+            api_key = settings.shared_api_key
+            provider_id = settings.shared_provider
+            custom_base_url = settings.shared_base_url
+            selected_model = _shared_model_name(_normalize_shared_model_id(user.model))
+        media_hints_enabled = _is_llama4_active_for_assist(
+            user=user,
+            selected_model=selected_model,
+            using_personal_api=user.use_personal_api,
+        )
+
+        if topic_hint and api_key and _should_try_llm_context_resolution(query, topic_hint):
+            rewritten_query, _ = await _resolve_search_query_with_llm(
+                raw_query=query,
+                topic_hint=topic_hint,
+                lang=lang,
+                provider_id=provider_id,
+                api_key=api_key,
+                model=selected_model,
+                custom_base_url=custom_base_url,
+            )
+            query = rewritten_query
 
         await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
         try:
-            results = await duckduckgo_search_news_aware(
+            results = await _run_ranked_web_search(
                 query,
+                topic_hint=topic_hint,
+                lang=lang,
                 max_results=settings.external_web_search_max_results,
             )
         except Exception:  # noqa: BLE001
@@ -1032,7 +1588,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             sources_lines.append(f"{idx}. {item.title}\n{item.url}")
         sources_text = "\n".join(sources_lines).strip()
         sources_token = _store_sources(sources_text)
-        sources_markup = sources_keyboard(token=sources_token)
+        sources_markup = sources_keyboard(token=sources_token, language=lang)
 
         # Fast-path: for time queries, extract the exact time from time.is if present.
         if _looks_like_current_time_query(query):
@@ -1063,22 +1619,6 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                     return
 
         # If we have an LLM key (personal or shared), also generate a concise answer based on sources.
-        provider_id = user.provider
-        custom_base_url = user.custom_base_url
-        api_key: str | None = None
-        selected_model = user.model
-
-        if user.use_personal_api:
-            api_key = await db.get_api_key(message.from_user.id, provider_id)
-            if provider_id == "custom" and not custom_base_url:
-                api_key = None
-            selected_model = (selected_model or PROVIDERS.get(provider_id, PROVIDERS["openai"]).default_model).strip()
-        else:
-            api_key = settings.shared_api_key
-            provider_id = settings.shared_provider
-            custom_base_url = settings.shared_base_url
-            selected_model = _shared_model_name(_normalize_shared_model_id(user.model))
-
         if not api_key:
             await message.answer(
                 _md(lang, "internet_search_answer_hint"),
@@ -1092,19 +1632,29 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             lang=lang,
             personality=user.personality,
             enable_web_search=False,
+            media_hints_enabled=media_hints_enabled,
+            response_lang=reply_lang,
             user_mention=_start_user_label(message),
             user_name=_start_user_name_only(message),
         )
+        active_personality_name = await _personality_name(message.from_user.id, lang, user.personality)
         web_context = format_search_results(results)
+        evidence_context = await _build_search_evidence_context(
+            results,
+            max_pages=max(1, len(results)),
+            max_chars_per_page=1800,
+        )
+        combined_context = web_context if not evidence_context else f"{web_context}\n\n{evidence_context}"
         context = [
             {"role": "system", "content": system_prompt},
+            {"role": "system", "content": _utc_now_context_prompt()},
             {
                 "role": "system",
                 "content": (
-                    f"{web_context}\n\n"
-                    "Task: answer the user's query using only these results. "
-                    "Do not invent facts. Cite sources as [1], [2], ... matching the list. "
-                    "Keep your usual style/personality."
+                    f"{combined_context}\n\n"
+                    "Task: answer the user's query using only these results and fetched page excerpts. "
+                    f"{_search_freshness_guardrail(query, intent=query_intent)} "
+                    f"{_search_answer_style_guardrail(active_personality_name, include_clarify=False)}"
                 ),
             },
             {"role": "user", "content": query},
@@ -1138,8 +1688,8 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         await state.clear()
         await _show_menu(message, lang)
 
-    @router.message(Command("language"))
-    async def on_language(message: Message, command: CommandObject) -> None:
+    @router.message(Command("language", "languages"))
+    async def on_language(message: Message, command: CommandObject, state: FSMContext) -> None:
         if message.from_user is None:
             return
         await db.ensure_user(message.from_user.id)
@@ -1581,7 +2131,8 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
 
         await state.set_state(SetupStates.waiting_api_key)
         await message.answer(
-            _md(lang, "ask_api_key", provider=provider_label(user.provider)),
+            _apikey_prompt_text(lang, provider_label(user.provider)),
+            reply_markup=cancel_input_keyboard(language=lang),
             parse_mode="MarkdownV2",
         )
 
@@ -2457,7 +3008,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             await query.answer()
             if query.message:
                 await query.message.answer(
-                    _md(lang, "ask_api_key", provider=provider_label(user.provider)),
+                    _apikey_prompt_text(lang, provider_label(user.provider)),
                     reply_markup=cancel_input_keyboard(language=lang),
                     parse_mode="MarkdownV2",
                 )
@@ -2603,6 +3154,11 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             api_key = settings.shared_api_key
             custom_base_url = settings.shared_base_url
             selected_model = _shared_model_name(shared_model_id)
+        media_hints_enabled = _is_llama4_active_for_assist(
+            user=user,
+            selected_model=selected_model,
+            using_personal_api=using_personal_api,
+        )
 
         if api_key is None:
             await message.answer(
@@ -2638,6 +3194,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         raw_text = (resolved_input_text or "").strip()
         if not raw_text:
             raw_text = _message_input_text(message)
+        reply_lang = _detect_reply_language(raw_text, fallback_lang=lang)
 
         if not using_personal_api:
             shared_input_cost = _estimate_shared_input_cost(
@@ -2662,6 +3219,19 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             is_first_message_in_chat = await db.chat_message_count(message.from_user.id, chat_id) == 0
 
         await db.add_message(message.from_user.id, "user", user_content_for_history, chat_id=chat_id)
+
+        # Current date/time requests without location are answered directly in UTC.
+        if _looks_like_utc_now_query(raw_text):
+            utc_reply = _utc_now_reply_text(lang)
+            await db.add_message(message.from_user.id, "assistant", utc_reply, chat_id=chat_id)
+            await _send_assistant_response(
+                message=message,
+                response=utc_reply,
+                lang=lang,
+                sources_token=None,
+            )
+            return
+
         previous_topic_hint = _get_topic_hint(message.from_user.id, chat_id)
         next_topic_hint = _next_topic_hint(raw_text, current_topic=previous_topic_hint)
         if next_topic_hint:
@@ -2704,54 +3274,26 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             lang=lang,
             personality=user.personality,
             enable_web_search=enable_openai_web_search,
+            media_hints_enabled=media_hints_enabled,
+            response_lang=reply_lang,
             user_mention=_start_user_label(message),
             user_name=_start_user_name_only(message),
         )
+        active_personality_name = await _personality_name(message.from_user.id, lang, user.personality)
         wants_capabilities_answer = _looks_like_bot_capabilities_question(raw_text)
         wants_models_answer = _looks_like_bot_models_question(raw_text)
         wants_guided_help = _looks_like_bot_assistance_request(raw_text)
-        context: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            *history,
-        ]
-        if wants_models_answer:
-            context.insert(
-                1,
-                {
-                    "role": "system",
-                    "content": _shared_models_prompt_for_message(message.message_id),
-                },
-            )
-        if wants_capabilities_answer:
-            context.insert(
-                1,
-                {
-                    "role": "system",
-                    "content": _capabilities_prompt_for_message(message.message_id),
-                },
-            )
-        if wants_guided_help:
-            context.insert(
-                1,
-                {
-                    "role": "system",
-                    "content": _bot_help_mode_prompt_for_message(message.message_id),
-                },
-            )
-        if topic_hint and _looks_like_context_dependent_followup(raw_text):
-            context.insert(
-                1,
-                {
-                    "role": "system",
-                    "content": (
-                        f"Conversation topic hint: {topic_hint}\n"
-                        "Treat the latest user message as a follow-up to this topic unless the user clearly switches topic."
-                    ),
-                },
-            )
+        context = _build_chat_context(
+            system_prompt=system_prompt,
+            history=history,
+            raw_text=raw_text,
+            topic_hint=topic_hint,
+            wants_models_answer=wants_models_answer,
+            wants_capabilities_answer=wants_capabilities_answer,
+            wants_guided_help=wants_guided_help,
+            message_id=message.message_id,
+            media_hints_enabled=media_hints_enabled,
+        )
 
         await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
 
@@ -2760,6 +3302,24 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         auto_search_needed = _should_auto_web_search(raw_text, wants_search, topic_hint=topic_hint)
         external_mode = (settings.external_web_search_mode or "auto").strip().lower()
         server_search_allowed = settings.web_search_backend in {"server", "hybrid"}
+        if (
+            not auto_search_needed
+            and not wants_search
+            and server_search_allowed
+            and api_key
+            and _should_try_llm_search_decision(raw_text, topic_hint)
+        ):
+            llm_auto_search = await _should_auto_web_search_with_llm(
+                raw_text=raw_text,
+                topic_hint=topic_hint,
+                lang=lang,
+                provider_id=provider_id,
+                api_key=api_key,
+                model=selected_model,
+                custom_base_url=custom_base_url,
+            )
+            if llm_auto_search:
+                auto_search_needed = True
         do_external_search = (
             server_search_allowed
             and (
@@ -2780,69 +3340,76 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         resolved_topic: str | None = None
         resolved_query: str | None = None
         if do_external_search and raw_text:
+            external_intent = _parse_search_intent(raw_text, topic_hint=topic_hint, lang=lang)
+            clarification = _search_clarification_prompt(
+                raw_text,
+                lang=lang,
+                intent=external_intent,
+                topic_hint=topic_hint,
+            )
+            if clarification:
+                await db.add_message(message.from_user.id, "assistant", clarification, chat_id=chat_id)
+                await _send_assistant_response(
+                    message=message,
+                    response=clarification,
+                    lang=lang,
+                    sources_token=None,
+                )
+                return
             try:
                 search_query, resolved_topic = _resolve_search_query(raw_text, history, topic_hint=topic_hint, lang=lang)
+                if topic_hint and api_key and _should_try_llm_context_resolution(search_query, topic_hint):
+                    rewritten_query, used_topic = await _resolve_search_query_with_llm(
+                        raw_query=search_query,
+                        topic_hint=topic_hint,
+                        lang=lang,
+                        provider_id=provider_id,
+                        api_key=api_key,
+                        model=selected_model,
+                        custom_base_url=custom_base_url,
+                    )
+                    search_query = rewritten_query
+                    if used_topic and not resolved_topic:
+                        label = LANGUAGE_LABELS.get(lang, "English")
+                        resolved_topic = f"{raw_text}\n\nTopic ({label}): {topic_hint}".strip()
                 resolved_query = search_query
                 if resolved_topic and history:
                     history[-1] = {"role": "user", "content": resolved_topic}
-                    context = [
-                        {
-                            "role": "system",
-                            "content": system_prompt,
-                        },
-                        *history,
-                    ]
-                    if wants_models_answer:
-                        context.insert(
-                            1,
-                            {
-                                "role": "system",
-                                "content": _shared_models_prompt_for_message(message.message_id),
-                            },
-                        )
-                    if wants_capabilities_answer:
-                        context.insert(
-                            1,
-                            {
-                                "role": "system",
-                                "content": _capabilities_prompt_for_message(message.message_id),
-                            },
-                        )
-                    if wants_guided_help:
-                        context.insert(
-                            1,
-                            {
-                                "role": "system",
-                                "content": _bot_help_mode_prompt_for_message(message.message_id),
-                            },
-                        )
-                    if topic_hint and _looks_like_context_dependent_followup(raw_text):
-                        context.insert(
-                            1,
-                            {
-                                "role": "system",
-                                "content": (
-                                    f"Conversation topic hint: {topic_hint}\n"
-                                    "Treat the latest user message as a follow-up to this topic unless the user clearly switches topic."
-                                ),
-                            },
-                        )
-                results = await duckduckgo_search_news_aware(
+                    context = _build_chat_context(
+                        system_prompt=system_prompt,
+                        history=history,
+                        raw_text=raw_text,
+                        topic_hint=topic_hint,
+                        wants_models_answer=wants_models_answer,
+                        wants_capabilities_answer=wants_capabilities_answer,
+                        wants_guided_help=wants_guided_help,
+                        message_id=message.message_id,
+                        media_hints_enabled=media_hints_enabled,
+                    )
+                results = await _run_ranked_web_search(
                     search_query,
+                    topic_hint=topic_hint,
+                    lang=lang,
                     max_results=settings.external_web_search_max_results,
                 )
                 search_results = results
                 formatted = format_search_results(results)
                 if formatted:
+                    evidence_context = await _build_search_evidence_context(
+                        results,
+                        max_pages=max(1, len(results)),
+                        max_chars_per_page=1800,
+                    )
+                    combined_search_context = formatted if not evidence_context else f"{formatted}\n\n{evidence_context}"
                     context.insert(
                         1,
                         {
                             "role": "system",
                             "content": (
-                                f"{formatted}\n\n"
-                                "Use only these results to answer. Do not invent facts. "
-                                "Cite sources as [1], [2], ... matching the list. "
-                                "If results are insufficient, say what is missing and ask for clarification."
+                                f"{combined_search_context}\n\n"
+                                "Use only these results and fetched page excerpts to answer. "
+                                f"{_search_freshness_guardrail(search_query, intent=external_intent)} "
+                                f"{_search_answer_style_guardrail(active_personality_name, include_clarify=True)}"
                             ),
                         },
                     )
@@ -2859,6 +3426,52 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                     )
             except Exception:  # noqa: BLE001
                 # Ignore web-search failures and proceed with the LLM.
+                pass
+
+        # Source-rescue path: if search intent exists but no server-side sources were attached,
+        # run a lightweight ranked search so Sources button is still available.
+        if (
+            not sources_token
+            and not search_results
+            and raw_text
+            and external_mode != "off"
+            and (wants_search or auto_search_needed)
+        ):
+            try:
+                rescued_results = await _run_ranked_web_search(
+                    raw_text,
+                    topic_hint=topic_hint,
+                    lang=lang,
+                    max_results=settings.external_web_search_max_results,
+                )
+                if rescued_results:
+                    search_results = rescued_results
+                    formatted = format_search_results(rescued_results)
+                    if formatted:
+                        evidence_context = await _build_search_evidence_context(
+                            rescued_results,
+                            max_pages=max(1, len(rescued_results)),
+                            max_chars_per_page=1800,
+                        )
+                        combined_search_context = formatted if not evidence_context else f"{formatted}\n\n{evidence_context}"
+                        rescue_intent = _parse_search_intent(raw_text, topic_hint=topic_hint, lang=lang)
+                        context.insert(
+                            1,
+                            {
+                                "role": "system",
+                                "content": (
+                                    f"{combined_search_context}\n\n"
+                                    "Use only these results and fetched page excerpts to answer. "
+                                    f"{_search_freshness_guardrail(raw_text, intent=rescue_intent)} "
+                                    f"{_search_answer_style_guardrail(active_personality_name, include_clarify=True)}"
+                                ),
+                            },
+                        )
+                        sources_lines = ["Sources:"]
+                        for idx, item in enumerate(rescued_results, start=1):
+                            sources_lines.append(f"{idx}. {item.title}\n{item.url}")
+                        sources_token = _store_sources("\n".join(sources_lines).strip())
+            except Exception:  # noqa: BLE001
                 pass
 
         # Fast-path: for time queries, extract the exact time from time.is if present.
@@ -3011,15 +3624,44 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
 
     @router.callback_query(F.data.startswith("sources:"))
     async def on_sources_callback(query: CallbackQuery) -> None:
+        if not query.data:
+            return
+        lang = "en"
+        if query.from_user is not None:
+            lang = await _user_lang(query.from_user.id)
         token = query.data.split(":", maxsplit=1)[1].strip()
         sources_text = sources_cache.get(token)
         if not sources_text:
-            await query.answer("Sources expired.", show_alert=True)
+            await query.answer(t(lang, "sources_expired"), show_alert=True)
             return
         await query.answer()
         if query.message:
-            for chunk in _split_message(sources_text, limit=3500):
-                await query.message.answer(chunk)
+            sent_message_ids: list[int] = []
+            chunks = _split_message(sources_text, limit=3500)
+            last_index = len(chunks) - 1
+            for index, chunk in enumerate(chunks):
+                reply_markup = sources_close_keyboard(token=token, language=lang) if index == last_index else None
+                sent = await query.message.answer(chunk, reply_markup=reply_markup)
+                sent_message_ids.append(sent.message_id)
+            if sent_message_ids:
+                existing_ids = sources_output_cache.get(token, [])
+                sources_output_cache[token] = [*existing_ids, *sent_message_ids]
+
+    @router.callback_query(F.data.startswith("sources_close:"))
+    async def on_sources_close_callback(query: CallbackQuery) -> None:
+        if not query.data:
+            return
+        token = query.data.split(":", maxsplit=1)[1].strip()
+        await query.answer()
+        if not query.message:
+            return
+        message_ids = sources_output_cache.get(token, [])
+        for message_id in message_ids:
+            try:
+                await query.bot.delete_message(chat_id=query.message.chat.id, message_id=message_id)
+            except TelegramBadRequest:
+                continue
+        sources_output_cache.pop(token, None)
 
     return router
 
@@ -3463,7 +4105,7 @@ def _shared_models_prompt_for_message(message_id: int) -> str:
     style_hints = [
         "Style hint: keep it short and direct, with one compact list.",
         "Style hint: answer in 2-3 short lines with a friendly tone.",
-        "Style hint: use concise bullets and highlight media support for LLAMA 4.",
+        "Style hint: use concise bullets and highlight media support for LLaMA 4.",
         "Style hint: vary wording naturally; avoid repeating a fixed template.",
     ]
     hint = style_hints[message_id % len(style_hints)]
@@ -3471,15 +4113,15 @@ def _shared_models_prompt_for_message(message_id: int) -> str:
         "Model facts for UrAI (use only when user asks about available models in the bot):\n"
         "Shared AI has exactly 3 models:\n"
         "1) GPT 4\n"
-        "2) LLAMA 3\n"
-        "3) LLAMA 4 (Media support)\n"
+        "2) LLaMA 3\n"
+        "3) LLaMA 4 (Media support)\n"
         "Optional note: users in Own API mode can set other model names manually via /model.\n"
         "Instruction: keep facts exact and avoid changing model names.\n"
         f"{hint}"
     )
 
 
-def _capabilities_prompt_for_message(message_id: int) -> str:
+def _capabilities_prompt_for_message(message_id: int, *, media_hints_enabled: bool) -> str:
     style_hints = [
         "Style hint: answer with a compact bullet list and short examples.",
         "Style hint: answer as a structured overview (2-3 short sections).",
@@ -3487,21 +4129,41 @@ def _capabilities_prompt_for_message(message_id: int) -> str:
         "Style hint: answer with numbered points and a brief practical usage tip.",
     ]
     hint = style_hints[message_id % len(style_hints)]
+    items = [
+        "AI chat in selected personality and language.",
+        "Internet search via /i and automatic web search when relevant.",
+        "Access to fresh/live web info with sources when available.",
+        "Model/provider controls: choose provider, model, base URL, and API mode (shared AI or own API key).",
+        "Settings hub and quick controls from Telegram UI.",
+        "Personality switching and custom user instructions.",
+        "Chat history browsing and starting a new clean chat.",
+    ]
+    if media_hints_enabled:
+        items.append(
+            "Media support (LLaMA 4): image understanding, voice transcription, and video-note transcription "
+            "(provider-dependent). For long/unclear tasks, suggest sending voice, screenshot/image, or a relevant file."
+        )
+    items.extend(
+        [
+            "Token/quota visibility in shared mode.",
+            "Privacy: developer does NOT have access to user voice/media files; processing goes through API keys/providers with end-to-end data flow.",
+            "Interface languages: en, ru, es, fr, tr, ar, de, it, pt, uk, hi.",
+            "Core commands: /start, /help, /privacy, /languages, /provider, /personality, /apikey, /deletekey, "
+            "/model, /baseurl, /settings, /limit, /tokens, /history, /newchat, /i \"query\", /cancel.",
+        ]
+    )
+    numbered = "\n".join(f"{idx}) {item}" for idx, item in enumerate(items, start=1))
+    media_instruction = (
+        "Instruction: when listing capabilities, highlight media support prominently."
+        if media_hints_enabled
+        else
+        "Instruction: mention media only if the user explicitly asks about media features."
+    )
     return (
         "Capability facts for UrAI (use only when user asks about bot features/capabilities):\n"
-        "1) AI chat in selected personality and language.\n"
-        "2) Internet search via /i and automatic web search when relevant.\n"
-        "3) Access to fresh/live web info with sources when available.\n"
-        "4) Model/provider controls: choose provider, model, base URL, and API mode (shared AI or own API key).\n"
-        "5) Settings hub and quick controls from Telegram UI.\n"
-        "6) Personality switching and custom user instructions.\n"
-        "7) Chat history browsing and starting a new clean chat.\n"
-        "8) Media support: image understanding, voice transcription, and video-note transcription (provider-dependent).\n"
-        "9) Token/quota visibility in shared mode.\n"
-        "10) Interface languages: en, ru, es, fr, tr, ar, de, it, pt, uk, hi.\n"
-        "11) Core commands: /start, /help, /language, /provider, /personality, /apikey, /deletekey, "
-        "/model, /baseurl, /settings, /limit, /tokens, /history, /newchat, /i \"query\", /cancel.\n"
+        f"{numbered}\n"
         "Instruction: mention all major capabilities above, but do not use identical wording every time.\n"
+        f"{media_instruction}\n"
         f"{hint}"
     )
 
@@ -3518,7 +4180,7 @@ def _bot_help_mode_prompt_for_message(message_id: int) -> str:
         "UrAI guide mode (use when user asks for help / says something doesn't work):\n"
         "1) Diagnose likely cause quickly based on the user's request.\n"
         "2) Provide exact steps in Telegram UI (button path) and exact commands where relevant.\n"
-        "3) Use real command names only: /start, /help, /language, /provider, /personality, /apikey, "
+        "3) Use real command names only: /start, /help, /privacy, /languages, /provider, /personality, /apikey, "
         "/deletekey, /model, /baseurl, /settings, /limit, /tokens, /history, /newchat, /i \"query\", /cancel.\n"
         "4) If there are 2 valid paths, provide both and mark one as recommended.\n"
         "5) Keep helping until the user confirms it works; do not answer with generic 'read docs'.\n"
@@ -3701,7 +4363,16 @@ def _is_generic_search_phrase(text: str) -> bool:
         "it",
         "this",
         "that",
+        "he",
+        "him",
+        "his",
+        "she",
+        "her",
+        "hers",
+        "they",
         "them",
+        "their",
+        "theirs",
         "those",
         "these",
         "about",
@@ -3715,6 +4386,19 @@ def _is_generic_search_phrase(text: str) -> bool:
         "та",
         "тот",
         "эти",
+        "он",
+        "него",
+        "нему",
+        "его",
+        "она",
+        "её",
+        "ее",
+        "неё",
+        "ней",
+        "они",
+        "их",
+        "им",
+        "ими",
         "про",
         "об",
         "на",
@@ -3821,8 +4505,16 @@ def _looks_like_context_dependent_followup(text: str) -> bool:
         "it",
         "this",
         "that",
+        "he",
+        "him",
+        "his",
+        "she",
+        "her",
+        "hers",
         "they",
         "them",
+        "their",
+        "theirs",
         "its",
         "это",
         "этот",
@@ -3830,10 +4522,19 @@ def _looks_like_context_dependent_followup(text: str) -> bool:
         "эти",
         "то",
         "он",
+        "его",
+        "него",
+        "ему",
         "она",
+        "её",
+        "ее",
+        "неё",
+        "ей",
         "они",
         "нему",
         "ней",
+        "их",
+        "ими",
         "those",
     }
     followup_phrases = (
@@ -3861,6 +4562,30 @@ def _looks_like_context_dependent_followup(text: str) -> bool:
         "когда выйдет",
         "источник?",
         "пруф?",
+        "about him",
+        "about her",
+        "about them",
+        "about it",
+        "про него",
+        "про неё",
+        "про нее",
+        "про них",
+        "о нем",
+        "о нём",
+        "о ней",
+        "u sure",
+        "you sure",
+        "are you sure",
+        "sure?",
+        "really?",
+        "seriously?",
+        "точно?",
+        "точно",
+        "ты уверен",
+        "вы уверены",
+        "серьезно?",
+        "серьёзно?",
+        "правда?",
     )
     followup_tokens = {
         "price",
@@ -3885,14 +4610,106 @@ def _looks_like_context_dependent_followup(text: str) -> bool:
         "новости",
         "купить",
         "скачать",
+        "sure",
+        "really",
+        "seriously",
+        "точно",
+        "уверен",
+        "уверены",
+        "серьезно",
+        "серьёзно",
+        "правда",
     }
     if any(p in value for p in followup_phrases):
         return True
+    if len(tokens) <= 8 and (tokens & pronouns):
+        has_about = any(token in {"about", "про", "об", "о"} for token in tokens)
+        has_lookup = _tokens_have_prefix(
+            tokens,
+            (
+                "search",
+                "look",
+                "find",
+                "check",
+                "verify",
+                "lookup",
+                "поищ",
+                "поиск",
+                "найд",
+                "провер",
+                "чек",
+                "чека",
+                "гугл",
+                "загугл",
+            ),
+        )
+        if has_about or has_lookup:
+            return True
     if len(tokens) <= 9 and (tokens & followup_tokens):
+        return True
+    if len(tokens) <= 4 and "?" in value and (tokens & {"sure", "really", "seriously", "точно", "уверен", "уверены", "серьезно", "серьёзно", "правда"}):
         return True
     if len(tokens) <= 6 and "?" in value and (tokens & pronouns):
         return True
     if len(tokens) <= 3 and tokens <= pronouns:
+        return True
+    return False
+
+
+def _looks_like_search_execution_confirmation(text: str) -> bool:
+    value = (text or "").strip().lower()
+    if not value or value.startswith("/"):
+        return False
+    tokens = _text_tokens(value)
+    if not tokens or len(tokens) > 7:
+        return False
+
+    phrase_markers = (
+        "use it",
+        "go ahead",
+        "do it",
+        "run it",
+        "execute it",
+        "search now",
+        "do search",
+        "use search",
+        "используй",
+        "давай",
+        "выполняй",
+        "запускай",
+        "запусти",
+        "ищи",
+        "поехали",
+        "продолжай",
+    )
+    if any(marker in value for marker in phrase_markers):
+        return True
+
+    confirm_tokens = {
+        "yes",
+        "yeah",
+        "yep",
+        "ok",
+        "okay",
+        "sure",
+        "start",
+        "run",
+        "do",
+        "use",
+        "search",
+        "да",
+        "ага",
+        "ок",
+        "окей",
+        "ладно",
+        "старт",
+        "запусти",
+        "ищи",
+        "поиск",
+        "используй",
+        "выполняй",
+    }
+    if len(tokens) <= 2 and tokens <= confirm_tokens:
         return True
     return False
 
@@ -3904,6 +4721,8 @@ def _next_topic_hint(raw_text: str, *, current_topic: str | None = None) -> str 
     if _is_generic_search_phrase(value):
         return current_topic
     if _looks_like_context_dependent_followup(value):
+        return current_topic
+    if _looks_like_search_execution_confirmation(value):
         return current_topic
 
     tokens = _text_tokens(value)
@@ -3935,6 +4754,14 @@ def _resolve_search_query(
     if not raw:
         return "", None
 
+    if _looks_like_search_execution_confirmation(raw):
+        if topic_hint:
+            return _compact_search_query(topic_hint), topic_hint
+        topic = _find_recent_topic_from_history(history, skip_text=raw)
+        if topic:
+            return _compact_search_query(topic), topic
+        return raw, None
+
     if _is_generic_search_phrase(raw):
         if topic_hint:
             return _compact_search_query(topic_hint), topic_hint
@@ -3947,6 +4774,15 @@ def _resolve_search_query(
     # expand it using the recent topic so the search query is meaningful.
     topic = topic_hint or _find_recent_topic_from_history(history, skip_text=raw)
     if topic:
+        # For profile/repo lookups with references like "his github", force a targeted domain query.
+        target_domain = _search_target_domain_from_intent(raw)
+        if target_domain and not _contains_domain_like(raw):
+            compact_topic = _compact_search_query(topic, max_words=8)
+            if compact_topic:
+                label = (LANGUAGE_LABELS.get(lang, "English") if lang else "English").strip()
+                resolved = f"{raw}\n\nTopic ({label}): {topic}".strip()
+                return f"{compact_topic} site:{target_domain}", resolved
+
         value = raw.lower()
         raw_tokens = _text_tokens(raw)
         followup_phrases = (
@@ -4018,6 +4854,1009 @@ def _resolve_search_query(
     return raw, None
 
 
+def _search_target_domain_from_intent(text: str) -> str | None:
+    value = (text or "").strip().lower()
+    if not value:
+        return None
+    tokens = _text_tokens(value)
+    if not tokens:
+        return None
+
+    gitlab_markers = {"gitlab", "гитлаб"}
+    github_markers = {"github", "гитхаб"}
+    linkedin_markers = {"linkedin", "линкедин", "линкедын"}
+    x_markers = {"x.com", "twitter", "x", "твиттер", "твитер"}
+    profile_markers = {
+        "profile",
+        "account",
+        "user",
+        "username",
+        "repo",
+        "repos",
+        "project",
+        "projects",
+        "repository",
+        "page",
+        "профиль",
+        "аккаунт",
+        "репо",
+        "проекты",
+        "проект",
+        "репозиторий",
+        "страница",
+    }
+    if tokens & gitlab_markers:
+        return "gitlab.com"
+
+    if tokens & github_markers:
+        if (tokens & profile_markers) or _looks_like_context_dependent_followup(value) or _is_generic_search_phrase(value):
+            return "github.com"
+        # If query explicitly mentions GitHub, bias toward GitHub domain.
+        return "github.com"
+    if tokens & linkedin_markers:
+        return "linkedin.com"
+    if tokens & x_markers:
+        return "x.com"
+
+    return None
+
+
+def _normalize_host(host: str) -> str:
+    value = (host or "").strip().lower().strip(".")
+    if value.startswith("www."):
+        return value[4:]
+    return value
+
+
+def _result_matches_domain(url: str, domain: str) -> bool:
+    if not url or not domain:
+        return False
+    host = _normalize_host(urlparse(url).netloc.split(":")[0])
+    target = _normalize_host(domain)
+    if not host or not target:
+        return False
+    return host == target or host.endswith(f".{target}")
+
+
+def _dedupe_search_results(results: list[WebSearchResult]) -> list[WebSearchResult]:
+    deduped: list[WebSearchResult] = []
+    seen: set[str] = set()
+    for item in results:
+        parsed = urlparse((item.url or "").strip())
+        if not parsed.netloc:
+            continue
+        host = _normalize_host(parsed.netloc.split(":")[0])
+        path = parsed.path.rstrip("/")
+        normalized = f"{parsed.scheme.lower()}://{host}{path}"
+        if parsed.query:
+            normalized = f"{normalized}?{parsed.query}"
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(item)
+    return deduped
+
+
+def _count_results_for_domains(results: list[WebSearchResult], domains: list[str]) -> int:
+    if not domains:
+        return 0
+    return sum(1 for item in results if any(_result_matches_domain(item.url, domain) for domain in domains))
+
+
+def _prioritize_search_results(
+    results: list[WebSearchResult],
+    *,
+    preferred_domains: list[str],
+    strict: bool,
+) -> list[WebSearchResult]:
+    items = _dedupe_search_results(results)
+    if not preferred_domains:
+        return items
+
+    preferred: list[WebSearchResult] = []
+    others: list[WebSearchResult] = []
+    for item in items:
+        if any(_result_matches_domain(item.url, domain) for domain in preferred_domains):
+            preferred.append(item)
+        else:
+            others.append(item)
+
+    if strict:
+        return preferred
+    if preferred:
+        return preferred + others
+    return items
+
+
+def _filter_noisy_search_results(
+    results: list[WebSearchResult],
+    *,
+    preferred_domains: list[str],
+    strict: bool,
+) -> list[WebSearchResult]:
+    if not results:
+        return []
+    if not strict:
+        return results
+
+    noisy_markers = (
+        "profile finder",
+        "user search",
+        "search users",
+        "how to search",
+        "search tool",
+        "extract user data",
+        "automation",
+        "tutorial",
+        "guide",
+    )
+    cleaned: list[WebSearchResult] = []
+    for item in results:
+        parsed = urlparse((item.url or "").strip())
+        host = _normalize_host(parsed.netloc.split(":")[0])
+        path = (parsed.path or "").lower()
+        body = f"{item.title} {item.snippet} {item.url}".lower()
+
+        if preferred_domains and not any(_result_matches_domain(item.url, domain) for domain in preferred_domains):
+            continue
+        if host in {"youtube.com", "m.youtube.com"}:
+            continue
+        if host == "github.com" and path.startswith("/search"):
+            continue
+        if host == "gitlab.com" and path.startswith("/explore"):
+            continue
+        if any(marker in body for marker in noisy_markers):
+            continue
+        cleaned.append(item)
+    return cleaned
+
+
+def _append_unique_domains(target: list[str], domains: list[str]) -> None:
+    seen = {_normalize_host(item) for item in target}
+    for item in domains:
+        host = _normalize_host(item)
+        if not host or host in seen:
+            continue
+        target.append(host)
+        seen.add(host)
+
+
+def _looks_like_profile_search(query: str) -> bool:
+    value = (query or "").strip().lower()
+    if not value:
+        return False
+    tokens = _text_tokens(value)
+    if not tokens:
+        return False
+    profile_tokens = {
+        "profile",
+        "account",
+        "user",
+        "username",
+        "repo",
+        "repos",
+        "project",
+        "projects",
+        "repository",
+        "handle",
+        "профиль",
+        "аккаунт",
+        "репо",
+        "проекты",
+        "проект",
+        "репозиторий",
+        "страница",
+        "юзер",
+    }
+    return (
+        _search_target_domain_from_intent(value) is not None
+        and (bool(tokens & profile_tokens) or _looks_like_context_dependent_followup(value) or _is_generic_search_phrase(value))
+    )
+
+
+def _extract_profile_handle_candidate(text: str, *, topic_hint: str | None = None) -> str | None:
+    values = [text]
+    if topic_hint:
+        values.append(topic_hint)
+    for raw in values:
+        value = (raw or "").strip()
+        if not value:
+            continue
+        # URL form: github.com/<handle>, gitlab.com/<handle>, x.com/<handle>, linkedin.com/in/<slug>
+        url_match = re.search(r"(?:github\.com|gitlab\.com|x\.com)/(?:in/)?([A-Za-z0-9_.-]{2,64})", value, flags=re.IGNORECASE)
+        if url_match:
+            return url_match.group(1).strip(".-_")
+        at_match = re.search(r"@([A-Za-z0-9_.-]{2,64})", value)
+        if at_match:
+            return at_match.group(1).strip(".-_")
+
+        tokens = re.findall(r"[A-Za-z0-9_.-]{2,64}", value)
+        stop = {
+            "search",
+            "find",
+            "about",
+            "who",
+            "what",
+            "where",
+            "when",
+            "is",
+            "are",
+            "tell",
+            "me",
+            "please",
+            "latest",
+            "news",
+            "profile",
+            "account",
+            "github",
+            "gitlab",
+            "linkedin",
+            "twitter",
+            "user",
+            "username",
+            "repo",
+            "repository",
+            "look",
+            "check",
+            "verify",
+            "профиль",
+            "аккаунт",
+            "гитхаб",
+            "гитлаб",
+            "репо",
+            "репозиторий",
+            "найди",
+            "поищи",
+            "про",
+            "него",
+            "нее",
+            "неё",
+            "их",
+            "кто",
+            "что",
+            "где",
+            "когда",
+            "скажи",
+            "мне",
+            "пожалуйста",
+            "his",
+            "her",
+            "their",
+            "has",
+            "have",
+            "had",
+            "what",
+            "which",
+            "other",
+            "project",
+            "projects",
+            "repos",
+            "there",
+            "those",
+            "these",
+            "them",
+            "look",
+            "into",
+            "from",
+            "with",
+            "without",
+            "for",
+            "and",
+            "or",
+            "to",
+            "of",
+            "in",
+            "on",
+            "at",
+        }
+        candidates: list[str] = []
+        for token in reversed(tokens):
+            candidate = token.strip(".-_")
+            if not candidate:
+                continue
+            low = candidate.lower()
+            if low in stop:
+                continue
+            if len(candidate) < 2:
+                continue
+            if low.isdigit():
+                continue
+            candidates.append(candidate)
+
+        if candidates:
+            def _candidate_score(item: str) -> tuple[int, int]:
+                low = item.lower()
+                score = 0
+                if re.search(r"\d", item):
+                    score += 3
+                if any(ch in item for ch in ("_", "-", ".")):
+                    score += 2
+                if re.search(r"[a-z]", low) and re.search(r"\d", low):
+                    score += 2
+                # Slight preference to plausible username lengths.
+                if 4 <= len(item) <= 24:
+                    score += 1
+                return score, len(item)
+
+            candidates.sort(key=_candidate_score, reverse=True)
+            return candidates[0]
+    return None
+
+
+def _parse_search_intent(query: str, *, topic_hint: str | None, lang: str | None) -> dict[str, Any]:
+    value = (query or "").strip()
+    tokens = _text_tokens(value)
+    domain = _search_target_domain_from_intent(value) or (topic_hint and _search_target_domain_from_intent(topic_hint)) or None
+
+    latest_markers = {
+        "latest",
+        "recent",
+        "today",
+        "current",
+        "now",
+        "breaking",
+        "live",
+        "последн",
+        "сегодня",
+        "сейчас",
+        "актуал",
+        "свеж",
+        "прямо",
+    }
+    wants_latest = any(marker in value.lower() for marker in latest_markers)
+
+    kinds: list[str] = []
+    if _looks_like_profile_search(value):
+        kinds.append("profile")
+    if any(token in tokens for token in {"news", "headline", "новости", "заголовки"}):
+        kinds.append("news")
+    if any(token in tokens for token in {"sport", "sports", "match", "score", "league", "матч", "счет", "лига", "турнир"}):
+        kinds.append("sports")
+    if any(token in tokens for token in {"price", "cost", "rate", "stock", "crypto", "цена", "стоимость", "курс"}):
+        kinds.append("price")
+    if any(token in tokens for token in {"docs", "documentation", "api", "reference", "документация", "доки"}):
+        kinds.append("docs")
+    if any(token in tokens for token in {"who", "what", "where", "country", "capital", "president", "ceo", "кто", "что", "где", "страна", "столица", "президент"}):
+        kinds.append("factual")
+    if not kinds:
+        kinds.append("general")
+
+    profile_handle = _extract_profile_handle_candidate(value, topic_hint=topic_hint) if "profile" in kinds else None
+    if not profile_handle and topic_hint and ("profile" in kinds or _is_generic_search_phrase(value) or _looks_like_context_dependent_followup(value)):
+        profile_handle = _extract_profile_handle_candidate(topic_hint, topic_hint=None)
+
+    primary_kind = kinds[0]
+    if "news" in kinds:
+        primary_kind = "news"
+    elif "sports" in kinds:
+        primary_kind = "sports"
+    elif "price" in kinds:
+        primary_kind = "price"
+    elif "profile" in kinds:
+        primary_kind = "profile"
+    elif "docs" in kinds:
+        primary_kind = "docs"
+    elif "factual" in kinds:
+        primary_kind = "factual"
+
+    normalized_lang = normalize_language(lang or "en")
+    return {
+        "kind": primary_kind,
+        "kinds": kinds,
+        "wants_latest": wants_latest,
+        "domain": domain,
+        "profile_handle": profile_handle,
+        "lang": normalized_lang,
+        "raw": value,
+    }
+
+
+def _query_is_broad(value: str, *, intent: dict[str, Any], topic_hint: str | None) -> bool:
+    raw = (value or "").strip()
+    if not raw:
+        return True
+    tokens = _text_tokens(raw)
+    if not tokens:
+        return True
+    if topic_hint and (_looks_like_context_dependent_followup(raw) or _looks_like_search_execution_confirmation(raw)):
+        return False
+    if intent.get("kind") == "profile":
+        # Profile queries should specify a handle or have contextual topic.
+        if intent.get("profile_handle") or topic_hint:
+            return False
+        return True
+    generic_bucket = {
+        "news",
+        "новости",
+        "sport",
+        "sports",
+        "match",
+        "price",
+        "country",
+        "company",
+        "organization",
+        "person",
+        "человек",
+        "компания",
+        "организация",
+        "страна",
+    }
+    if len(tokens) <= 3 and tokens <= generic_bucket:
+        return True
+    if len(tokens) <= 2 and not topic_hint:
+        if all(token in generic_bucket for token in tokens):
+            return True
+    return False
+
+
+def _search_clarification_prompt(query: str, *, lang: str, intent: dict[str, Any], topic_hint: str | None) -> str | None:
+    if not _query_is_broad(query, intent=intent, topic_hint=topic_hint):
+        return None
+    normalized_lang = normalize_language(lang)
+    kind = str(intent.get("kind") or "general")
+
+    if normalized_lang == "ru":
+        if kind == "profile":
+            return "Уточни, пожалуйста, кого именно искать: username/ссылка и платформу (GitHub/GitLab/LinkedIn/X)."
+        if kind == "news":
+            return "Уточни тему новостей: про кого/что именно и за какой период (сегодня, неделя, месяц)."
+        if kind == "sports":
+            return "Уточни команду/турнир и период (например: последние 5 матчей Карабаха)."
+        if kind == "price":
+            return "Уточни, цену чего именно нужно найти и в какой валюте."
+        return "Уточни, пожалуйста, запрос: про кого/что искать и какой результат нужен."
+
+    if kind == "profile":
+        return "Please specify who to look up: username/link and platform (GitHub/GitLab/LinkedIn/X)."
+    if kind == "news":
+        return "Please clarify the news topic: about whom/what and for what period (today, week, month)."
+    if kind == "sports":
+        return "Please specify the team/tournament and period (for example: last 5 Qarabag matches)."
+    if kind == "price":
+        return "Please specify what price you want and in which currency."
+    return "Please clarify the query: what exactly should I search for and what result you need."
+
+
+def _has_non_latin_script(text: str) -> bool:
+    if not text:
+        return False
+    return bool(re.search(r"[^\x00-\x7F]", text))
+
+
+def _language_aware_query_variants(query: str, *, intent: dict[str, Any], topic_hint: str | None) -> list[str]:
+    base = (query or "").strip()
+    if not base:
+        return []
+    variants: list[str] = [base]
+
+    kind = str(intent.get("kind") or "general")
+    wants_repos = _profile_query_wants_repositories(base)
+    entity = intent.get("profile_handle") or (topic_hint and _compact_search_query(topic_hint, max_words=8)) or ""
+    needs_bridge = _has_non_latin_script(base)
+
+    if needs_bridge:
+        if kind == "profile":
+            platform = _search_target_domain_from_intent(base) or _search_target_domain_from_intent(topic_hint or "")
+            platform_hint = "github" if platform == "github.com" else "gitlab" if platform == "gitlab.com" else "profile"
+            bridge = f"{entity or base} {platform_hint} profile".strip()
+            variants.append(bridge)
+            if wants_repos:
+                variants.append(f"{entity or base} {platform_hint} repositories".strip())
+                variants.append(f"{entity or base} {platform_hint} projects".strip())
+        elif kind == "news":
+            variants.append(f"{entity or base} latest news".strip())
+        elif kind == "sports":
+            variants.append(f"{entity or base} match results today".strip())
+        elif kind == "price":
+            variants.append(f"{entity or base} price today".strip())
+        elif kind == "docs":
+            variants.append(f"{entity or base} official documentation".strip())
+        elif kind == "factual":
+            variants.append(f"{entity or base} facts".strip())
+
+    # Include topic-enriched variant when query omits subject.
+    if topic_hint and not _query_mentions_topic(base, topic_hint):
+        variants.append(f"{base} {_compact_search_query(topic_hint, max_words=8)}".strip())
+    if kind == "profile" and wants_repos:
+        platform = _search_target_domain_from_intent(base) or _search_target_domain_from_intent(topic_hint or "")
+        if platform == "github.com":
+            variants.append(f"{entity or base} github repositories".strip())
+            variants.append(f"{entity or base} site:github.com".strip())
+        elif platform == "gitlab.com":
+            variants.append(f"{entity or base} gitlab projects".strip())
+            variants.append(f"{entity or base} site:gitlab.com".strip())
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in variants:
+        normalized = re.sub(r"\s+", " ", item).strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        deduped.append(normalized)
+        seen.add(key)
+    return deduped
+
+
+def _extract_recency_days(text: str) -> float | None:
+    value = (text or "").strip().lower()
+    if not value:
+        return None
+    if any(token in value for token in ("today", "сегодня")):
+        return 0.0
+    if any(token in value for token in ("yesterday", "вчера")):
+        return 1.0
+
+    rel_hours = re.search(r"\b(\d{1,3})\s*(hour|hours|hr|hrs|ч|час|часа|часов)\b", value)
+    if rel_hours:
+        return int(rel_hours.group(1)) / 24.0
+    rel_days = re.search(r"\b(\d{1,3})\s*(day|days|дн|день|дня|дней)\b", value)
+    if rel_days:
+        return float(int(rel_days.group(1)))
+
+    iso_match = re.search(r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", value)
+    if iso_match:
+        year = int(iso_match.group(1))
+        month = int(iso_match.group(2))
+        day = int(iso_match.group(3))
+        try:
+            date_value = datetime(year=year, month=month, day=day, tzinfo=timezone.utc)
+            delta = datetime.now(timezone.utc) - date_value
+            return max(0.0, float(delta.days))
+        except ValueError:
+            return None
+    return None
+
+
+def _apply_recency_ranking(results: list[WebSearchResult], *, intent: dict[str, Any]) -> list[WebSearchResult]:
+    if not results:
+        return []
+    kind = str(intent.get("kind") or "general")
+    wants_latest = bool(intent.get("wants_latest"))
+    if kind not in {"news", "sports", "price"} and not wants_latest:
+        return results
+
+    scored: list[tuple[int, float, int, WebSearchResult]] = []
+    for idx, item in enumerate(results):
+        recency = _extract_recency_days(f"{item.title} {item.snippet} {item.url}")
+        if recency is None:
+            scored.append((1, 10_000.0, idx, item))
+        else:
+            scored.append((0, recency, idx, item))
+    scored.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [item[3] for item in scored]
+
+
+async def _fallback_backend_search(
+    query: str,
+    *,
+    intent: dict[str, Any],
+    topic_hint: str | None,
+    max_results: int,
+) -> list[WebSearchResult]:
+    kind = str(intent.get("kind") or "general")
+    domain = str(intent.get("domain") or "")
+    handle = str(intent.get("profile_handle") or "").strip()
+    lang_code = str(intent.get("lang") or "en")
+    entity = handle or _extract_profile_handle_candidate(query, topic_hint=topic_hint) or _compact_search_query(topic_hint or "", max_words=8)
+
+    collected: list[WebSearchResult] = []
+
+    if kind == "profile":
+        try:
+            if domain == "github.com" and entity:
+                collected.extend(await github_user_search(entity, max_results=max_results))
+            elif domain == "gitlab.com" and entity:
+                collected.extend(await gitlab_user_search(entity, max_results=max_results))
+            elif entity:
+                collected.extend(await github_user_search(entity, max_results=max_results))
+                if len(collected) < max_results:
+                    collected.extend(await gitlab_user_search(entity, max_results=max_results - len(collected)))
+        except Exception:  # noqa: BLE001
+            pass
+
+    if not collected and kind in {"factual", "news", "general"} and domain not in {"github.com", "gitlab.com", "linkedin.com", "x.com"}:
+        wiki_query = entity or query
+        if wiki_query:
+            try:
+                collected.extend(await wikipedia_search(wiki_query, max_results=max_results, language=lang_code))
+            except Exception:  # noqa: BLE001
+                pass
+
+    return _dedupe_search_results(collected)[:max_results]
+
+
+def _trusted_domains_for_query(query: str, *, topic_hint: str | None = None) -> list[str]:
+    combined = f"{query or ''} {topic_hint or ''}".strip().lower()
+    tokens = _text_tokens(combined)
+    if not tokens:
+        return []
+
+    trusted: list[str] = []
+
+    news_tokens = {"news", "headline", "breaking", "новости", "заголовки", "срочно"}
+    sports_tokens = {"sport", "sports", "match", "score", "team", "league", "матч", "счет", "команда", "лига"}
+    docs_tokens = {"docs", "documentation", "api", "reference", "manual", "документация", "доки", "справка"}
+    factual_tokens = {
+        "who",
+        "кто",
+        "person",
+        "biography",
+        "organization",
+        "company",
+        "country",
+        "capital",
+        "population",
+        "president",
+        "ceo",
+        "человек",
+        "биография",
+        "организация",
+        "компания",
+        "страна",
+        "столица",
+        "население",
+        "президент",
+    }
+
+    if tokens & news_tokens:
+        _append_unique_domains(trusted, ["reuters.com", "apnews.com", "bbc.com", "aljazeera.com", "reddit.com"])
+    if tokens & sports_tokens:
+        _append_unique_domains(trusted, ["espn.com", "sofascore.com", "flashscore.com", "uefa.com", "fifa.com", "reddit.com"])
+    if tokens & docs_tokens:
+        _append_unique_domains(trusted, ["developer.mozilla.org", "docs.python.org", "readthedocs.io", "github.com", "wikipedia.org"])
+    if tokens & factual_tokens:
+        _append_unique_domains(trusted, ["wikipedia.org", "britannica.com", "worldbank.org", "un.org", "reddit.com"])
+    if not trusted:
+        # Prefer community/explanatory sources slightly more often for broad questions.
+        _append_unique_domains(trusted, ["wikipedia.org", "reddit.com"])
+
+    return trusted
+
+
+def _preferred_domains_for_search(query: str, *, topic_hint: str | None = None) -> tuple[list[str], bool]:
+    domain = _search_target_domain_from_intent(query)
+    if not domain and topic_hint:
+        domain = _search_target_domain_from_intent(topic_hint)
+    trusted_domains = _trusted_domains_for_query(query, topic_hint=topic_hint)
+
+    tokens = _text_tokens(query)
+    strict_markers = {
+        "profile",
+        "account",
+        "user",
+        "username",
+        "repo",
+        "repository",
+        "профиль",
+        "аккаунт",
+        "репо",
+        "репозиторий",
+        "страница",
+        "link",
+        "links",
+        "ссылка",
+        "ссылки",
+    }
+    strict = bool(
+        domain
+        and (
+            bool(tokens & strict_markers)
+            or _is_generic_search_phrase(query)
+            or _looks_like_context_dependent_followup(query)
+        )
+    )
+
+    domains: list[str] = []
+    if domain:
+        _append_unique_domains(domains, [domain])
+    if not strict:
+        _append_unique_domains(domains, trusted_domains)
+
+    return domains, strict
+
+
+def _build_precise_search_query(
+    query: str,
+    *,
+    topic_hint: str | None,
+    preferred_domains: list[str],
+    strict: bool,
+) -> str:
+    base = (query or "").strip()
+    if not base:
+        return ""
+    if "site:" in base.lower():
+        return base
+    if not strict or not preferred_domains:
+        return base
+
+    if topic_hint and not _query_mentions_topic(base, topic_hint):
+        topic_part = _compact_search_query(topic_hint, max_words=8)
+        if topic_part:
+            base = f"{base} {topic_part}".strip()
+    return f"{base} site:{preferred_domains[0]}".strip()
+
+
+async def _run_ranked_web_search(
+    query: str,
+    *,
+    topic_hint: str | None,
+    lang: str,
+    max_results: int,
+) -> list[WebSearchResult]:
+    normalized_query = (query or "").strip()
+    if not normalized_query:
+        return []
+    intent = _parse_search_intent(normalized_query, topic_hint=topic_hint, lang=lang)
+    preferred_domains, strict_domain = _preferred_domains_for_search(normalized_query, topic_hint=topic_hint)
+
+    if (
+        intent.get("kind") == "profile"
+        and str(intent.get("domain") or "") in {"github.com", "gitlab.com"}
+        and str(intent.get("profile_handle") or "").strip()
+        and not _profile_query_wants_repositories(normalized_query)
+    ):
+        primary_profile_results = await _fallback_backend_search(
+            normalized_query,
+            intent=intent,
+            topic_hint=topic_hint,
+            max_results=max_results,
+        )
+        if primary_profile_results:
+            return primary_profile_results
+
+    attempts: list[str] = []
+    for variant in _language_aware_query_variants(normalized_query, intent=intent, topic_hint=topic_hint):
+        precise_query = _build_precise_search_query(
+            variant,
+            topic_hint=topic_hint,
+            preferred_domains=preferred_domains,
+            strict=strict_domain,
+        )
+        if precise_query:
+            attempts.append(precise_query)
+        if any(domain == "wikipedia.org" for domain in preferred_domains):
+            attempts.append(f"{variant} site:wikipedia.org")
+        if any(domain == "reddit.com" for domain in preferred_domains):
+            attempts.append(f"{variant} site:reddit.com")
+        attempts.append(variant)
+    if strict_domain and preferred_domains and topic_hint:
+        fallback_query = f"{_compact_search_query(topic_hint, max_words=8)} site:{preferred_domains[0]}".strip()
+        if fallback_query:
+            attempts.append(fallback_query)
+
+    dedup_attempts: list[str] = []
+    seen_attempts: set[str] = set()
+    for item in attempts:
+        normalized = re.sub(r"\s+", " ", item).strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen_attempts:
+            continue
+        dedup_attempts.append(normalized)
+        seen_attempts.add(key)
+
+    best_relaxed: list[WebSearchResult] = []
+    for attempt in dedup_attempts:
+        results = await duckduckgo_search_news_aware(attempt, max_results=max_results)
+        results = _prioritize_search_results(
+            results,
+            preferred_domains=preferred_domains,
+            strict=strict_domain,
+        )
+        results = _filter_noisy_search_results(
+            results,
+            preferred_domains=preferred_domains,
+            strict=strict_domain,
+        )
+        results = _apply_recency_ranking(results, intent=intent)
+
+        if results:
+            if not strict_domain:
+                return results
+            if _count_results_for_domains(results, preferred_domains) > 0:
+                return results
+            if not best_relaxed:
+                best_relaxed = results
+
+    fallback_results = await _fallback_backend_search(
+        normalized_query,
+        intent=intent,
+        topic_hint=topic_hint,
+        max_results=max_results,
+    )
+    if fallback_results:
+        fallback_results = _prioritize_search_results(
+            fallback_results,
+            preferred_domains=preferred_domains,
+            strict=False,
+        )
+        fallback_results = _apply_recency_ranking(fallback_results, intent=intent)
+        return fallback_results
+
+    if best_relaxed:
+        return best_relaxed
+
+    # Safety fallback: return plain DDG results without strict ranking/filtering,
+    # so the response can still include source links.
+    try:
+        plain = await duckduckgo_search_news_aware(normalized_query, max_results=max_results)
+    except Exception:  # noqa: BLE001
+        plain = []
+    plain = _dedupe_search_results(plain)
+    if plain:
+        return plain
+
+    try:
+        plain_direct = await duckduckgo_search(normalized_query, max_results=max_results)
+    except Exception:  # noqa: BLE001
+        plain_direct = []
+    return _dedupe_search_results(plain_direct)
+
+
+def _profile_query_wants_repositories(query: str) -> bool:
+    tokens = _text_tokens(query or "")
+    if not tokens:
+        return False
+    repo_tokens = {
+        "repo",
+        "repos",
+        "repository",
+        "repositories",
+        "project",
+        "projects",
+        "portfolio",
+        "код",
+        "репо",
+        "репозиторий",
+        "репозитории",
+        "проект",
+        "проекты",
+    }
+    return bool(tokens & repo_tokens)
+
+
+def _query_mentions_topic(query: str, topic: str) -> bool:
+    query_tokens = _text_tokens(query)
+    topic_tokens = _text_tokens(_compact_search_query(topic, max_words=12))
+    if not query_tokens or not topic_tokens:
+        return False
+    meaningful_query = {token for token in query_tokens if len(token) >= 3}
+    meaningful_topic = {token for token in topic_tokens if len(token) >= 3}
+    if meaningful_query and meaningful_topic:
+        return bool(meaningful_query & meaningful_topic)
+    return bool(query_tokens & topic_tokens)
+
+
+def _strip_markdown_code_fence(text: str) -> str:
+    value = (text or "").strip()
+    if value.startswith("```") and value.endswith("```"):
+        lines = value.splitlines()
+        if len(lines) >= 2:
+            return "\n".join(lines[1:-1]).strip()
+    return value
+
+
+def _extract_query_from_llm_output(raw_output: str, *, fallback: str) -> tuple[str, bool]:
+    """
+    Parse query-rewrite output from the model.
+
+    Expected shape: JSON object with keys `query` and `use_topic`.
+    Falls back to permissive parsing for robustness.
+    """
+    cleaned = _strip_markdown_code_fence(raw_output)
+    if not cleaned:
+        return fallback, False
+
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:  # noqa: BLE001
+        parsed = None
+
+    if isinstance(parsed, dict):
+        query = str(parsed.get("query", "")).strip()
+        use_topic = bool(parsed.get("use_topic"))
+        if query:
+            return query, use_topic
+
+    line_match = re.search(r"(?:^|\n)\s*query\s*[:=]\s*(.+)", cleaned, flags=re.IGNORECASE)
+    if line_match:
+        candidate = line_match.group(1).strip().strip("\"'")
+        if candidate:
+            return candidate, ("use_topic" in cleaned.lower() and "true" in cleaned.lower())
+
+    first_line = next((line.strip() for line in cleaned.splitlines() if line.strip()), "")
+    if first_line:
+        compact = first_line.strip().strip("\"'")
+        if compact:
+            return compact, False
+
+    return fallback, False
+
+
+def _extract_search_decision_from_llm_output(raw_output: str) -> tuple[bool, float | None]:
+    cleaned = _strip_markdown_code_fence(raw_output)
+    if not cleaned:
+        return False, None
+
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:  # noqa: BLE001
+        parsed = None
+
+    if isinstance(parsed, dict):
+        search_flag = bool(parsed.get("search") or parsed.get("should_search"))
+        confidence_raw = parsed.get("confidence")
+        confidence: float | None
+        if isinstance(confidence_raw, (int, float)):
+            confidence = max(0.0, min(1.0, float(confidence_raw)))
+        else:
+            confidence = None
+        return search_flag, confidence
+
+    line_flag = re.search(r"(?:^|\n)\s*(?:search|should_search)\s*[:=]\s*(true|false|yes|no|1|0)", cleaned, re.I)
+    if line_flag:
+        token = line_flag.group(1).lower()
+        return token in {"true", "yes", "1"}, None
+
+    compact = cleaned.strip().lower()
+    if compact in {"true", "yes", "1", "search"}:
+        return True, None
+    return False, None
+
+
+def _should_try_llm_context_resolution(raw_query: str, topic_hint: str | None) -> bool:
+    if not topic_hint:
+        return False
+    query = (raw_query or "").strip()
+    if not query:
+        return False
+    if len(query) > 220:
+        return False
+    if _contains_domain_like(query):
+        return False
+    if _query_mentions_topic(query, topic_hint):
+        return False
+
+    tokens = _text_tokens(query)
+    if not tokens:
+        return False
+    if len(tokens) <= 10:
+        return True
+    if _is_generic_search_phrase(query) or _looks_like_context_dependent_followup(query):
+        return True
+    return False
+
+
+def _should_try_llm_search_decision(raw_text: str, topic_hint: str | None) -> bool:
+    value = (raw_text or "").strip()
+    if not value:
+        return False
+    if value.startswith("/"):
+        return False
+    if "```" in value:
+        return False
+    if len(value) > 320:
+        return False
+    if _contains_domain_like(value):
+        return False
+
+    tokens = _text_tokens(value)
+    if not tokens:
+        return False
+    if topic_hint and len(tokens) <= 12:
+        return True
+    if "?" in value and len(tokens) <= 20:
+        return True
+    if len(tokens) <= 8:
+        return True
+    return False
+
+
 def _looks_like_time_query(text: str) -> bool:
     value = (text or "").strip().lower()
     if not value:
@@ -4065,6 +5904,59 @@ def _looks_like_current_time_query(text: str) -> bool:
         "сейчас",
     )
     if any(m in value for m in markers):
+        return True
+    return False
+
+
+def _looks_like_utc_now_query(text: str) -> bool:
+    value = (text or "").strip().lower()
+    if not value:
+        return False
+    date_markers = {
+        "what is the date",
+        "today date",
+        "date today",
+        "какая сегодня дата",
+        "какое сегодня число",
+        "сегодняшняя дата",
+    }
+    has_date_marker = any(marker in value for marker in date_markers)
+    if not _looks_like_time_query(value) and not has_date_marker:
+        return False
+    if _parse_time_conversion_query(value) is not None:
+        return False
+
+    # City/location queries should go through web search.
+    if re.search(r"\btime in\s+[a-zа-я]", value):
+        if not re.search(r"\btime in\s+(utc|gmt)\b", value):
+            return False
+    if "время в " in value and "время в utc" not in value and "время в gmt" not in value:
+        return False
+    if re.search(r"^\s*(?:in|в)\s*(?:utc|gmt)\s*[+-]\s*\d{1,2}(?::?\d{2})?\s*$", value):
+        return False
+    if re.search(r"\b(?:utc|gmt)\s*[+-]\s*\d{1,2}(?::?\d{2})?\b", value):
+        return False
+
+    utc_markers = {
+        "what time is it",
+        "what time now",
+        "current time",
+        "time now",
+        "который час",
+        "сколько времени",
+        "какое сейчас время",
+        "текущее время",
+    }
+    if has_date_marker or any(marker in value for marker in utc_markers):
+        return True
+    if re.search(r"\b(?:what\s+time|current\s+time|time\s+now|time)\s*(?:is\s+it\s*)?(?:in\s+)?(?:utc|gmt)\b", value):
+        return True
+    if re.search(r"\b(?:который\s+час|сколько\s+времени|какое\s+сейчас\s+время|текущее\s+время)\s*(?:в\s+)?(?:utc|gmt)\b", value):
+        return True
+
+    # Short generic asks like "time?" / "время?" should default to UTC.
+    compact = re.sub(r"[^a-zа-я0-9 ]+", " ", value).strip()
+    if compact in {"time", "время", "date", "дата"}:
         return True
     return False
 
@@ -4140,6 +6032,45 @@ async def _find_time_is_url(location: str) -> str | None:
     return None
 
 
+def _detect_reply_language(text: str, *, fallback_lang: str) -> str:
+    fallback = normalize_language(fallback_lang or "en")
+    value = (text or "").strip()
+    if not value:
+        return fallback
+
+    # Script-based detection for non-latin languages.
+    if re.search(r"[\u0600-\u06FF]", value):
+        return "ar"
+    if re.search(r"[\u0900-\u097F]", value):
+        return "hi"
+    if re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", value):
+        if re.search(r"[ІіЇїЄєҐґ]", value):
+            return "uk"
+        return "ru"
+
+    # Lightweight token heuristics for latin-script languages.
+    tokens = _text_tokens(value.lower())
+    if not tokens:
+        return fallback
+
+    def _score(markers: set[str]) -> int:
+        return sum(1 for token in tokens if token in markers)
+
+    lang_markers: dict[str, set[str]] = {
+        "es": {"que", "de", "para", "como", "hola", "gracias", "por", "donde", "cuando", "porque"},
+        "fr": {"que", "pour", "avec", "bonjour", "merci", "est", "quoi", "comment", "vous", "dans"},
+        "de": {"der", "die", "das", "und", "ist", "nicht", "wie", "was", "danke", "ich"},
+        "it": {"che", "per", "con", "come", "ciao", "grazie", "sono", "non", "dove", "quando"},
+        "pt": {"que", "para", "com", "como", "ola", "obrigado", "voce", "nao", "onde", "quando"},
+        "tr": {"ve", "bir", "bu", "icin", "merhaba", "tesekkur", "nasil", "ne", "evet", "hayir"},
+    }
+    scores = {lang: _score(markers) for lang, markers in lang_markers.items()}
+    best_lang = max(scores, key=scores.get)
+    if scores[best_lang] >= 2:
+        return best_lang
+    return "en" if re.search(r"[A-Za-z]", value) else fallback
+
+
 def _format_day_shift(lang: str, shift: int) -> str:
     if shift == 0:
         return ""
@@ -4165,6 +6096,8 @@ def _should_auto_web_search(text: str, wants_search: bool, *, topic_hint: str | 
 
     tokens = _text_tokens(value)
     if _looks_like_time_query(value):
+        return True
+    if topic_hint and _looks_like_search_execution_confirmation(value):
         return True
     if _looks_like_context_dependent_followup(value) and topic_hint:
         return True
@@ -4411,6 +6344,42 @@ def _should_auto_web_search(text: str, wants_search: bool, *, topic_hint: str | 
     return False
 
 
+def _search_answer_style_guardrail(personality_name: str, *, include_clarify: bool) -> str:
+    label = (personality_name or "selected personality").strip()
+    text = (
+        "Do not invent facts. "
+        "Use sources internally for factual grounding, but do not output source numbers/links unless the user explicitly asks. "
+        "Stay strictly on the asked question: no unrelated comparisons, anecdotes, or extra trivia. "
+        "For factual questions, answer directly in the first sentence. "
+        f"Keep the selected assistant personality ({label}) in tone, structure, and wording; "
+        "do not switch to a generic neutral assistant voice."
+    )
+    if include_clarify:
+        text += " If results are insufficient, say what is missing and ask for clarification."
+    return text
+
+
+async def _build_search_evidence_context(
+    results: list[WebSearchResult],
+    *,
+    max_pages: int = 3,
+    max_chars_per_page: int = 1200,
+) -> str:
+    if not results:
+        return ""
+    try:
+        extracts = await fetch_page_extracts(
+            results,
+            max_pages=max_pages,
+            max_chars_per_page=max_chars_per_page,
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+    if not extracts:
+        return ""
+    return format_page_extracts(extracts)
+
+
 def _split_message(text: str, limit: int = 4000) -> list[str]:
     if len(text) <= limit:
         return [text]
@@ -4453,6 +6422,13 @@ def _shared_model_label(lang: str, model_id: str) -> str:
     return t(lang, SHARED_MODEL_PRESETS[safe_model_id]["label_key"])
 
 
+def _is_llama4_active_for_assist(*, user: UserSettings, selected_model: str, using_personal_api: bool) -> bool:
+    if not using_personal_api:
+        return _normalize_shared_model_id(user.model) == "llama4_media"
+    raw = (selected_model or user.model or "").strip().lower()
+    return "llama-4" in raw or "llama4" in raw
+
+
 def _payload_has_media(user_payload: dict[str, Any]) -> bool:
     content = user_payload.get("content")
     if not isinstance(content, list):
@@ -4488,7 +6464,7 @@ async def _send_assistant_response(
     sources_token: str | None = None,
 ) -> None:
     display_response = _prepare_response_for_display(response)
-    sources_markup = sources_keyboard(token=sources_token) if sources_token else None
+    sources_markup = sources_keyboard(token=sources_token, language=lang) if sources_token else None
 
     if _should_send_response_as_image(response):
         if await _send_response_as_image(

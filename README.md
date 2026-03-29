@@ -150,6 +150,7 @@ Important optional settings:
 ## Bot Commands
 
 - `/start` — quick onboarding and control keyboard
+- `/privacy` — detailed privacy, encryption, and data-flow overview
 - `/settings` — settings hub and configuration shortcuts
 - `/language` — switch interface language
 - `/provider` — choose provider
@@ -179,6 +180,7 @@ Important optional settings:
 - Localization fallback resolves missing keys to English.
 - The repository includes additional technical docs:
   - `ENCRYPTION_SETUP.md`
+  - `PRIVACY_AND_ENCRYPTION.md`
   - `MARKDOWN_IMPLEMENTATION.md`
   - `MARKDOWNV2_ESCAPING_GUIDE.md`
 

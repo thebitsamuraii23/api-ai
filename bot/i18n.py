@@ -8,6 +8,7 @@ SUPPORTED_PERSONALITIES = (
     "psychologist",
     "programmer",
     "teacher",
+    "mentor",
     "marketer",
     "product_manager",
     "writer",
@@ -52,7 +53,7 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
         "help": (
             "📚 Commands:\n"
-            "• /language - choose interface language\n"
+            "• /languages - choose interface language\n"
             "• /provider - choose AI provider\n"
             "• /personality - choose AI personality\n"
             "• /apikey - save API key for current provider\n"
@@ -101,6 +102,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "unknown_provider": "⚠️ Unknown provider. Use /provider.",
         "unsupported_language": "⚠️ Unsupported language.",
         "ask_api_key": "🔐 Send your API key for {provider}.",
+        "apikey_privacy_reminder": "🛡️ API-key storage is end-to-end encrypted. Learn more: /privacy",
+        "apikey_cancel_hint": "❌ To cancel input, send /cancel",
         "api_key_saved": "✅ API key saved for {provider}.",
         "provider_auto_switched": "🔄 Detected {detected} key. Provider switched: {from_provider} → {to_provider}.",
         "api_key_removed": "🗑️ API key deleted for {provider}.",
@@ -122,8 +125,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "access_mode_shared": "Shared AI",
         "access_mode_personal": "Own API",
         "model_gpt4": "GPT 4",
-        "model_llama3": "LLAMA 3",
-        "model_llama4_media": "LLAMA 4 (Media)",
+        "model_llama3": "LLaMA 3",
+        "model_llama4_media": "LLaMA 4 (Media)",
         "btn_own_api": "🔐 Own API",
         "btn_use_bot_ai": "Use Bot's AI (With limits)",
         "ask_base_url": "🔗 Send API base URL (example: https://api.example.com/v1)",
@@ -146,12 +149,14 @@ TEXTS: dict[str, dict[str, str]] = {
             "{status} Shared AI quota\n"
             "📊 Used: {used} / {limit} ({percent}%)\n"
             "💎 Available: {remaining}\n"
-            "{bar}"
+            "{bar}\n"
+            "🗓️ Shared AI quota resets every month."
         ),
         "limit_personal": (
             "🔐 Own API mode\n"
             "🌟 Bot token quota doesn't apply here\n"
-            "🪙 Available tokens: ∞"
+            "🪙 Available tokens: ∞\n"
+            "🗓️ Shared AI quota resets every month."
         ),
         "history_cleared": "🗑️ History cleared.",
         "new_chat_started": "🆕 New chat started.",
@@ -181,6 +186,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_language": "🌐 Language",
         "btn_personality": "🎭 Personality",
         "btn_internet_search": "🔎 Internet search",
+        "btn_sources": "📚 Sources",
+        "btn_close_sources": "❌ Close",
+        "sources_expired": "Sources expired.",
         "btn_limit": "🧮 Limit",
         "btn_custom_instructions": "🧾 Custom instructions",
         "btn_custom_instructions_new": "➕ Add custom instructions",
@@ -201,6 +209,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "personality_psychologist": "🧠 Psychologist",
         "personality_programmer": "💻 Programmer",
         "personality_teacher": "📚 Teacher",
+        "personality_mentor": "🧭 Mentor",
         "personality_marketer": "📈 Marketer",
         "personality_product_manager": "🗂️ Product manager",
         "personality_writer": "✍️ Writer",
@@ -252,7 +261,7 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
         "help": (
             "📚 Команды:\n"
-            "• /language - выбрать язык интерфейса\n"
+            "• /languages - выбрать язык интерфейса\n"
             "• /provider - выбрать AI-провайдера\n"
             "• /personality - выбрать личность AI\n"
             "• /apikey - сохранить API-ключ текущего провайдера\n"
@@ -301,6 +310,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "unknown_provider": "⚠️ Неизвестный провайдер. Используйте /provider.",
         "unsupported_language": "⚠️ Неподдерживаемый язык.",
         "ask_api_key": "🔐 Отправьте API-ключ для {provider}.",
+        "apikey_privacy_reminder": "🛡️ Хранение API-ключей работает с end-to-end шифрованием. Подробнее: /privacy",
+        "apikey_cancel_hint": "❌ Чтобы отменить ввод, отправьте /cancel",
         "api_key_saved": "✅ API-ключ сохранён для {provider}.",
         "provider_auto_switched": "🔄 Определён ключ {detected}. Провайдер переключён: {from_provider} → {to_provider}.",
         "api_key_removed": "🗑️ API-ключ удалён для {provider}.",
@@ -322,8 +333,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "access_mode_shared": "Мой ИИ",
         "access_mode_personal": "Свой API",
         "model_gpt4": "GPT 4",
-        "model_llama3": "LLAMA 3",
-        "model_llama4_media": "LLAMA 4 (Media)",
+        "model_llama3": "LLaMA 3",
+        "model_llama4_media": "LLaMA 4 (Media)",
         "btn_own_api": "🔐 Свой API",
         "btn_use_bot_ai": "Use Bot's AI (With limits)",
         "ask_base_url": "🔗 Отправьте базовый URL API (пример: https://api.example.com/v1)",
@@ -346,12 +357,14 @@ TEXTS: dict[str, dict[str, str]] = {
             "{status} Квота моего ИИ\n"
             "📊 Использовано: {used} / {limit} ({percent}%)\n"
             "💎 Доступно: {remaining}\n"
-            "{bar}"
+            "{bar}\n"
+            "🗓️ Квота моего ИИ обновляется каждый месяц."
         ),
         "limit_personal": (
             "🔐 Режим Свой API\n"
             "🌟 Лимит токенов бота здесь не применяется\n"
-            "🪙 Доступно токенов: ∞"
+            "🪙 Доступно токенов: ∞\n"
+            "🗓️ Квота моего ИИ обновляется каждый месяц."
         ),
         "history_cleared": "🗑️ История очищена.",
         "new_chat_started": "🆕 Начат новый чат.",
@@ -381,6 +394,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_language": "🌐 Язык",
         "btn_personality": "🎭 Личности",
         "btn_internet_search": "🔎 Интернет-поиск",
+        "btn_sources": "📚 Источники",
+        "btn_close_sources": "❌ Закрыть",
+        "sources_expired": "Источники устарели.",
         "btn_limit": "🧮 Лимит",
         "btn_custom_instructions": "🧾 Кастомные инструкции",
         "btn_custom_instructions_new": "➕ Добавить кастомные инструкции",
@@ -401,6 +417,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "personality_psychologist": "🧠 Психолог",
         "personality_programmer": "💻 Программист",
         "personality_teacher": "📚 Преподаватель",
+        "personality_mentor": "🧭 Ментор",
         "personality_marketer": "📈 Маркетолог",
         "personality_product_manager": "🗂️ Продакт-менеджер",
         "personality_writer": "✍️ Писатель",
@@ -447,7 +464,7 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
         "help": (
             "Comandos:\n"
-            "/language - elegir idioma\n"
+            "/languages - elegir idioma\n"
             "/provider - elegir proveedor de IA\n"
             "/personality - elegir personalidad de IA\n"
             "/apikey - guardar clave API del proveedor actual\n"
@@ -514,6 +531,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_language": "🌐 Idioma",
         "btn_personality": "🎭 Personalidad",
         "btn_internet_search": "🔎 Busqueda en internet",
+        "btn_sources": "📚 Fuentes",
+        "btn_close_sources": "❌ Cerrar",
+        "sources_expired": "Las fuentes caducaron.",
         "btn_limit": "🧮 Limite",
         "btn_model": "🧠 Modelo",
         "btn_newchat": "🆕 Nuevo chat",
@@ -525,6 +545,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "personality_psychologist": "🧠 Psicologo",
         "personality_programmer": "💻 Programador",
         "personality_teacher": "📚 Profesor",
+        "personality_mentor": "🧭 Mentor",
         "personality_marketer": "📈 Especialista en marketing",
         "personality_product_manager": "🗂️ Product manager",
         "personality_writer": "✍️ Escritor",
@@ -549,7 +570,7 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
         "help": (
             "Commandes:\n"
-            "/language - choisir la langue\n"
+            "/languages - choisir la langue\n"
             "/provider - choisir le fournisseur IA\n"
             "/personality - choisir une personnalite IA\n"
             "/apikey - enregistrer la cle API du fournisseur actuel\n"
@@ -616,6 +637,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_language": "🌐 Langue",
         "btn_personality": "🎭 Personnalite",
         "btn_internet_search": "🔎 Recherche internet",
+        "btn_sources": "📚 Sources",
+        "btn_close_sources": "❌ Fermer",
+        "sources_expired": "Les sources ont expire.",
         "btn_limit": "🧮 Limite",
         "btn_model": "🧠 Modele",
         "btn_newchat": "🆕 Nouveau chat",
@@ -627,6 +651,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "personality_psychologist": "🧠 Psychologue",
         "personality_programmer": "💻 Programmeur",
         "personality_teacher": "📚 Enseignant",
+        "personality_mentor": "🧭 Mentor",
         "personality_marketer": "📈 Marketeur",
         "personality_product_manager": "🗂️ Chef de produit",
         "personality_writer": "✍️ Ecrivain",
@@ -651,7 +676,7 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
         "help": (
             "Komutlar:\n"
-            "/language - dil sec\n"
+            "/languages - dil sec\n"
             "/provider - AI saglayici sec\n"
             "/personality - AI kisiligi sec\n"
             "/apikey - mevcut saglayici icin API anahtari kaydet\n"
@@ -718,6 +743,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_language": "🌐 Dil",
         "btn_personality": "🎭 Kisilik",
         "btn_internet_search": "🔎 Internet arama",
+        "btn_sources": "📚 Kaynaklar",
+        "btn_close_sources": "❌ Kapat",
+        "sources_expired": "Kaynaklarin suresi doldu.",
         "btn_limit": "🧮 Limit",
         "btn_model": "🧠 Model",
         "btn_newchat": "🆕 Yeni sohbet",
@@ -729,6 +757,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "personality_psychologist": "🧠 Psikolog",
         "personality_programmer": "💻 Programci",
         "personality_teacher": "📚 Ogretmen",
+        "personality_mentor": "🧭 Mentor",
         "personality_marketer": "📈 Pazarlamaci",
         "personality_product_manager": "🗂️ Urun yoneticisi",
         "personality_writer": "✍️ Yazar",
@@ -750,7 +779,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "welcome": "مرحبا. هذا البوت يعمل فقط بمفتاح API الخاص بك. اختر المزود والمفتاح ثم ابدأ المحادثة.",
         "help": (
             "الاوامر:\n"
-            "/language - اختيار اللغة\n"
+            "/languages - اختيار اللغة\n"
             "/provider - اختيار مزود الذكاء الاصطناعي\n"
             "/personality - اختيار شخصية الذكاء الاصطناعي\n"
             "/apikey - حفظ مفتاح API للمزود الحالي\n"
@@ -817,6 +846,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_language": "🌐 اللغة",
         "btn_personality": "🎭 الشخصية",
         "btn_internet_search": "🔎 بحث على الانترنت",
+        "btn_sources": "📚 المصادر",
+        "btn_close_sources": "❌ اغلاق",
+        "sources_expired": "انتهت صلاحية المصادر.",
         "btn_limit": "🧮 الحد",
         "btn_model": "🧠 النموذج",
         "btn_newchat": "🆕 دردشة جديدة",
@@ -828,6 +860,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "personality_psychologist": "🧠 اخصائي نفسي",
         "personality_programmer": "💻 مبرمج",
         "personality_teacher": "📚 معلم",
+        "personality_mentor": "🧭 Mentor",
         "personality_marketer": "📈 مسوق",
         "personality_product_manager": "🗂️ مدير منتج",
         "personality_writer": "✍️ كاتب",
@@ -858,6 +891,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "menu_title": "✨ Hauptmenue:",
         "btn_back": "⬅️ Zurueck",
         "btn_language": "🌐 Sprache",
+        "btn_sources": "📚 Quellen",
+        "btn_close_sources": "❌ Schliessen",
+        "sources_expired": "Quellen sind abgelaufen.",
         "only_private": "🔒 Bitte nutze den Bot im privaten Chat.",
         "system_prompt": "Du bist ein hilfreicher KI-Assistent. Antworte immer auf {language_name}.",
     },
@@ -875,6 +911,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "menu_title": "✨ Menu principale:",
         "btn_back": "⬅️ Indietro",
         "btn_language": "🌐 Lingua",
+        "btn_sources": "📚 Fonti",
+        "btn_close_sources": "❌ Chiudi",
+        "sources_expired": "Le fonti sono scadute.",
         "only_private": "🔒 Usa il bot nella chat privata.",
         "system_prompt": "Sei un assistente AI utile. Rispondi sempre in {language_name}.",
     },
@@ -892,6 +931,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "menu_title": "✨ Menu principal:",
         "btn_back": "⬅️ Voltar",
         "btn_language": "🌐 Idioma",
+        "btn_sources": "📚 Fontes",
+        "btn_close_sources": "❌ Fechar",
+        "sources_expired": "As fontes expiraram.",
         "only_private": "🔒 Use o bot no chat privado.",
         "system_prompt": "Voce e um assistente de IA util. Responda sempre em {language_name}.",
     },
@@ -909,6 +951,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "menu_title": "✨ Головне меню:",
         "btn_back": "⬅️ Назад",
         "btn_language": "🌐 Мова",
+        "btn_sources": "📚 Джерела",
+        "btn_close_sources": "❌ Закрити",
+        "sources_expired": "Джерела застаріли.",
         "only_private": "🔒 Використовуйте бота в приватному чаті.",
         "system_prompt": "Ти корисний AI-асистент. Завжди відповідай {language_name}.",
     },
@@ -926,6 +971,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "menu_title": "✨ मुख्य मेन्यू:",
         "btn_back": "⬅️ वापस",
         "btn_language": "🌐 भाषा",
+        "btn_sources": "📚 स्रोत",
+        "btn_close_sources": "❌ बंद करें",
+        "sources_expired": "स्रोतों की समय-सीमा समाप्त हो गई।",
         "only_private": "🔒 कृपया बोट को निजी चैट में उपयोग करें।",
         "system_prompt": "आप एक सहायक AI असिस्टेंट हैं। हमेशा {language_name} में उत्तर दें।",
     },
