@@ -28,7 +28,7 @@ UrAI encrypts user API keys before writing to DB.
 
 - Cryptographic primitive: `cryptography.fernet.Fernet`
 - Secret used for encryption/decryption: `DATA_ENCRYPTION_KEY`
-- Database field: `api_keys.encrypted_key`
+- Database field: `api_kes.encrypted_key`
 
 Implementation references in codebase:
 

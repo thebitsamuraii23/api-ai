@@ -11,8 +11,9 @@ def model_preset_keyboard(*, language: str, active_model: str, personal_api_enab
     builder = InlineKeyboardBuilder()
     items = [
         ("gpt4", t(language, "model_gpt4")),
-        ("llama3", t(language, "model_llama3")),
         ("llama4_media", t(language, "model_llama4_media")),
+        ("llama3", t(language, "model_llama3")),
+        ("groq_compound", t(language, "model_groq_compound")),
     ]
     for model_id, label in items:
         prefix = "✅ " if (not personal_api_enabled and active_model == model_id) else ""
@@ -21,7 +22,7 @@ def model_preset_keyboard(*, language: str, active_model: str, personal_api_enab
     own_api_prefix = "✅ " if personal_api_enabled else ""
     builder.button(text=f"{own_api_prefix}{t(language, 'btn_own_api')}", callback_data="modelpreset:own_api")
     builder.button(text=t(language, "btn_back"), callback_data="menu:home")
-    builder.adjust(1, 1, 1, 1, 1)
+    builder.adjust(1, 1, 1, 1, 1, 1)
     return builder.as_markup()
 
 
@@ -365,14 +366,15 @@ def quick_model_selection_keyboard(*, language: str) -> InlineKeyboardMarkup:
     """Быстрый выбор модели для shared AI."""
     builder = InlineKeyboardBuilder()
     models = [
-        ("llama3", "🦙 Llama 3"),
         ("gpt4", "🧠 GPT-4"),
         ("llama4_media", "🎬 Llama 4 Media"),
+        ("llama3", "🦙 Llama 3"),
+        ("groq_compound", "⚡ Groq Compound"),
     ]
     for model_id, label in models:
         builder.button(text=label, callback_data=f"modelpreset:{model_id}")
     builder.button(text=t(language, "btn_back"), callback_data="menu:home")
-    builder.adjust(1, 1, 1, 1)
+    builder.adjust(1, 1, 1, 1, 1)
     return builder.as_markup()
 
 

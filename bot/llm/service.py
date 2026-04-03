@@ -97,6 +97,9 @@ class LLMService:
                 "distil-whisper-large-v3-en",
                 "whisper-1",
             ]
+        if provider_id == "google":
+            # Google AI Studio OpenAI-compatible endpoint does not provide Whisper-style transcription.
+            return []
         return ["gpt-4o-mini-transcribe", "whisper-1"]
 
     async def generate_reply(

@@ -20,6 +20,7 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message
 import httpx
+from wcwidth import wcswidth
 
 from bot.config import Settings
 from bot.db import Database, UserSettings
@@ -165,6 +166,25 @@ RESPONSE_IMAGE_IMAGE_FRAME_COLOR = (67, 76, 96)
 RESPONSE_IMAGE_HIGHLIGHT_FILL_COLOR = (38, 50, 76)
 RESPONSE_IMAGE_MAX_INLINE_IMAGE_HEIGHT = 920
 RESPONSE_IMAGE_MAX_INLINE_IMAGE_BYTES = 8 * 1024 * 1024
+RESPONSE_IMAGE_EMOJI_MAX_BYTES = 512 * 1024
+RESPONSE_IMAGE_EMOJI_FETCH_TIMEOUT = 8.0
+RESPONSE_IMAGE_EMOJI_SEGMENT_PREFIX = "emoji_img:"
+RESPONSE_IMAGE_EMOJI_CACHE_MAX_ITEMS = 2048
+RESPONSE_IMAGE_FRACTION_SEGMENT_PREFIX = "fraction_img:"
+FRACTION_PAYLOAD_SEPARATOR = "\x1f"
+TWEMOJI_CDN_BASE = "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72"
+EMOJI_HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; UrAI/1.0; +https://example.invalid)"}
+_EMOJI_IMAGE_CACHE: dict[str, bytes | None] = {}
+RESPONSE_TABLE_CELL_PADDING_X = 16
+RESPONSE_TABLE_CELL_PADDING_Y = 12
+RESPONSE_TABLE_MIN_COL_WIDTH = 150
+RESPONSE_TABLE_MAX_COL_WIDTH = 460
+RESPONSE_TABLE_BORDER_WIDTH = 2
+RESPONSE_TABLE_BG_COLOR = (20, 24, 35, 230)
+RESPONSE_TABLE_BORDER_COLOR = (122, 140, 174, 255)
+RESPONSE_TABLE_HEADER_BG_COLOR = (42, 66, 113, 255)
+RESPONSE_TABLE_ROW_BG_ODD = (30, 38, 58, 220)
+RESPONSE_TABLE_ROW_BG_EVEN = (24, 31, 47, 215)
 SUPERSCRIPT_CHAR_MAP: dict[str, str] = {
     "0": "⁰",
     "1": "¹",
@@ -359,20 +379,25 @@ DEFAULT_SHARED_MODEL_ID = "llama4_media"
 SHARED_MODEL_PRESETS: dict[str, dict[str, str]] = {
     "gpt4": {
         "label_key": "model_gpt4",
-        "model_name": "openai/gpt-oss-20b",
-    },
-    "llama3": {
-        "label_key": "model_llama3",
-        "model_name": "llama-3.3-70b-versatile",
+        "model_name": "openai/gpt-oss-120b",
     },
     "llama4_media": {
         "label_key": "model_llama4_media",
         "model_name": "meta-llama/llama-4-scout-17b-16e-instruct",
     },
+    "llama3": {
+        "label_key": "model_llama3",
+        "model_name": "llama-3.3-70b-versatile",
+    },
+    "groq_compound": {
+        "label_key": "model_groq_compound",
+        "model_name": "groq/compound",
+    },
 }
 SHARED_TOKEN_COSTS: dict[str, dict[str, int]] = {
     "llama3": {"text_in": 120, "media_extra": 420, "out_per_200_chars": 60},
     "gpt4": {"text_in": 250, "media_extra": 1100, "out_per_200_chars": 120},
+    "groq_compound": {"text_in": 220, "media_extra": 980, "out_per_200_chars": 105},
     "llama4_media": {"text_in": 200, "media_extra": 850, "out_per_200_chars": 90},
 }
 
@@ -1080,14 +1105,17 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         formatting_guardrail = (
             "Formatting: do not use LaTeX commands like \\cdot, \\frac, \\sqrt, \\begin, \\end. "
             "Write formulas in plain text with Unicode symbols (for example: ·, ×, ÷, ≤, ≥, √). "
-            "Always write mathematical division using the Unicode fraction slash '⁄' (never plain '/'). "
-            "For standalone one-fraction lines, present division as a visible fraction (numerator, bar, denominator)."
+            "For linear formulas, use the regular '/' division sign. "
+            "For standalone one-fraction lines, prefer '(numerator)/(denominator)' so it can be rendered as a visible fraction."
         )
         presentation_guardrail = (
             "Presentation style (applies to all personalities): use Markdown formatting frequently to improve readability "
-            "(short headings, bullet lists, bold highlights, and inline code when helpful). "
+            "(short headings, bullet lists, bold highlights, blockquotes, and inline code when helpful). "
             "Use visible emphasis in most non-trivial replies: highlight key terms with **bold**, and structure steps with short section headers. "
-            "When a response has 3+ sentences, prefer at least one bold highlight and one compact list. "
+            "For comparisons, options, pricing, metrics, trade-offs, or 3+ structured items, prefer a Markdown pipe table with a valid separator row. "
+            "Do not draw ASCII-art tables; use proper Markdown tables only. "
+            "When a response has 3+ sentences, prefer at least one bold highlight and one compact list or one compact table. "
+            "Vary visual style naturally across replies (headings, compact callouts, quote blocks, checklist/list mix) instead of repeating one template. "
             "Use emojis in most replies: usually include 1 relevant emoji, sometimes 2 for longer responses. "
             "Keep emoji usage moderate (normally no more than 2, hard max 3) and avoid spam or decorative clutter."
         )
@@ -1105,7 +1133,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         )
         models_guardrail = (
             "Shared AI models policy (applies to all personalities): if the user asks what models are available in the "
-            "bot, state clearly that Shared AI has exactly 3 models: GPT 4, LLaMA 3, and LLaMA 4 (Media support). "
+            "bot, state clearly that Shared AI has exactly 4 models: GPT 4, LLaMA 4 (Media support), LLaMA 3, and Groq Compound. "
             "Mention model details only when the user asks about models/features."
         )
         clean_mention = (user_mention or "").strip() or "the user"
@@ -4124,10 +4152,11 @@ def _shared_models_prompt_for_message(message_id: int) -> str:
     hint = style_hints[message_id % len(style_hints)]
     return (
         "Model facts for UrAI (use only when user asks about available models in the bot):\n"
-        "Shared AI has exactly 3 models:\n"
+        "Shared AI has exactly 4 models:\n"
         "1) GPT 4\n"
-        "2) LLaMA 3\n"
-        "3) LLaMA 4 (Media support)\n"
+        "2) LLaMA 4 (Media support)\n"
+        "3) LLaMA 3\n"
+        "4) Groq Compound\n"
         "Optional note: users in Own API mode can set other model names manually via /model.\n"
         "Instruction: keep facts exact and avoid changing model names.\n"
         f"{hint}"
@@ -6393,14 +6422,34 @@ async def _build_search_evidence_context(
     return format_page_extracts(extracts)
 
 
-def _split_message(text: str, limit: int = 4000) -> list[str]:
+def _split_message(text: str, limit: int = 3200) -> list[str]:
     if len(text) <= limit:
         return [text]
     parts: list[str] = []
     start = 0
     while start < len(text):
         end = min(start + limit, len(text))
-        parts.append(text[start:end])
+        if end < len(text):
+            split_floor = start + max(1, limit // 2)
+            newline_break = text.rfind("\n", split_floor, end)
+            if newline_break > start:
+                end = newline_break + 1
+            else:
+                space_break = text.rfind(" ", split_floor, end)
+                if space_break > start:
+                    end = space_break + 1
+
+        if end <= start:
+            end = min(start + limit, len(text))
+
+        chunk = text[start:end]
+        if chunk.endswith("\\") and end < len(text):
+            end -= 1
+            chunk = text[start:end]
+
+        if not chunk:
+            break
+        parts.append(chunk)
         start = end
     return parts
 
@@ -6414,6 +6463,10 @@ def _normalize_shared_model_id(raw_model: str) -> str:
         "llama3": "llama3",
         "llama-3": "llama3",
         "llama_3": "llama3",
+        "groq_compound": "groq_compound",
+        "groq-compound": "groq_compound",
+        "groq compound": "groq_compound",
+        "groq/compound": "groq_compound",
         "llama4": "llama4_media",
         "llama-4": "llama4_media",
         "llama_4": "llama4_media",
@@ -6594,6 +6647,7 @@ def _contains_math_notation(text: str) -> bool:
 
 def _prepare_response_for_display(text: str) -> str:
     normalized = text
+    normalized = _replace_latex_text_styles(normalized)
     normalized = re.sub(r"\\+begin\{[^{}]+\}", "", normalized)
     normalized = re.sub(r"\\+end\{[^{}]+\}", "", normalized)
     normalized = re.sub(r"\\+text\{([^{}]*)\}", r"\1", normalized)
@@ -6608,6 +6662,7 @@ def _prepare_response_for_display(text: str) -> str:
 
     # Convert known LaTeX commands to readable symbols/words.
     normalized = re.sub(r"\\+([A-Za-z]+)", _latex_command_replacer, normalized)
+    normalized = _replace_latex_text_styles(normalized)
     normalized = normalized.replace(r"\{", "{").replace(r"\}", "}")
     normalized = normalized.replace(r"\_", "_").replace(r"\%", "%")
     normalized = re.sub(r"\\([^\w\s])", r"\1", normalized)
@@ -6616,6 +6671,29 @@ def _prepare_response_for_display(text: str) -> str:
     normalized = _replace_numeric_fractions(normalized)
     normalized = _replace_math_fraction_slashes(normalized)
     return normalized
+
+
+def _replace_latex_text_styles(text: str) -> str:
+    current = text
+    replacers: tuple[tuple[re.Pattern[str], str], ...] = (
+        (re.compile(r"\\+textbf\s*\{([^{}]+)\}", flags=re.DOTALL), r"**\1**"),
+        (re.compile(r"\\+mathbf\s*\{([^{}]+)\}", flags=re.DOTALL), r"**\1**"),
+        (re.compile(r"\\+boldsymbol\s*\{([^{}]+)\}", flags=re.DOTALL), r"**\1**"),
+        (re.compile(r"\\+textit\s*\{([^{}]+)\}", flags=re.DOTALL), r"*\1*"),
+        (re.compile(r"\\+emph\s*\{([^{}]+)\}", flags=re.DOTALL), r"*\1*"),
+        (re.compile(r"\btextbf\s*\(([^()]+)\)", flags=re.DOTALL), r"**\1**"),
+        (re.compile(r"\bmathbf\s*\(([^()]+)\)", flags=re.DOTALL), r"**\1**"),
+        (re.compile(r"\btextit\s*\(([^()]+)\)", flags=re.DOTALL), r"*\1*"),
+        (re.compile(r"\bemph\s*\(([^()]+)\)", flags=re.DOTALL), r"*\1*"),
+    )
+    for _ in range(8):
+        updated = current
+        for pattern, replacement in replacers:
+            updated = pattern.sub(replacement, updated)
+        if updated == current:
+            break
+        current = updated
+    return current
 
 
 def _latex_command_replacer(match: re.Match[str]) -> str:
@@ -6652,14 +6730,7 @@ def _format_fraction_for_display(numerator: str, denominator: str) -> str:
     compact_key = f"{num}/{den}"
     if compact_key in UNICODE_FRACTION_MAP:
         return UNICODE_FRACTION_MAP[compact_key]
-
-    if re.fullmatch(r"[0-9]+", num) and re.fullmatch(r"[0-9]+", den):
-        num_super = _to_script(num, SUPERSCRIPT_CHAR_MAP)
-        den_sub = _to_script(den, SUBSCRIPT_CHAR_MAP)
-        if num_super and den_sub:
-            return f"{num_super}⁄{den_sub}"
-
-    return f"({num})⁄({den})"
+    return f"({num})/({den})"
 
 
 def _replace_numeric_fractions(text: str) -> str:
@@ -6671,11 +6742,7 @@ def _replace_numeric_fractions(text: str) -> str:
         key = f"{num}/{den}"
         if key in UNICODE_FRACTION_MAP:
             return UNICODE_FRACTION_MAP[key]
-        num_super = _to_script(num, SUPERSCRIPT_CHAR_MAP)
-        den_sub = _to_script(den, SUBSCRIPT_CHAR_MAP)
-        if num_super and den_sub:
-            return f"{num_super}⁄{den_sub}"
-        return f"{num}⁄{den}"
+        return f"{num}/{den}"
 
     return pattern.sub(repl, text)
 
@@ -6711,7 +6778,7 @@ def _replace_math_fraction_slashes(text: str) -> str:
     lines: list[str] = []
     for raw_line in text.split("\n"):
         line = raw_line
-        if "/" not in line:
+        if "/" not in line and "⁄" not in line:
             lines.append(line)
             continue
         lowered = line.lower()
@@ -6723,7 +6790,8 @@ def _replace_math_fraction_slashes(text: str) -> str:
             lines.append(line)
             continue
         if _looks_math_like_line(line):
-            line = line.replace("/", "⁄")
+            # Keep plain slash for cleaner math rendering and normalize rare fraction slash.
+            line = line.replace("⁄", "/")
         lines.append(line)
     return "\n".join(lines)
 
@@ -6784,18 +6852,40 @@ async def _render_response_text_to_jpg_pages(
     measure_draw = ImageDraw.Draw(measure_canvas)
 
     normalized_text = _normalize_text_for_image(text)
+    normalized_text, inline_tables = _extract_markdown_tables_for_inline_render(normalized_text)
+
+    combined_inline_images = dict(inline_images or {})
+    next_inline_index = (max(combined_inline_images.keys()) + 1) if combined_inline_images else 0
+    for table_index, table_rows in enumerate(inline_tables):
+        table_bytes = await _render_markdown_table_to_png_bytes(
+            table_rows,
+            fonts=fonts,
+            max_table_width=max_text_width,
+        )
+        table_token = f"[[INLINE_TABLE_{table_index}]]"
+        if table_bytes:
+            image_token = f"[[INLINE_IMAGE_{next_inline_index}]]"
+            normalized_text = normalized_text.replace(table_token, image_token)
+            combined_inline_images[next_inline_index] = table_bytes
+            next_inline_index += 1
+        else:
+            normalized_text = normalized_text.replace(table_token, "[table unavailable]")
+
     normalized_text = _normalize_markdown_tables_for_image(normalized_text)
     prepared_inline_images = _prepare_inline_images_for_render(
-        inline_images or {},
+        combined_inline_images,
         image_module=Image,
         max_width=max_text_width,
     )
+    emoji_images = await _fetch_emoji_images_for_text(normalized_text)
+    prepared_emoji_images = _prepare_emoji_images_for_render(emoji_images, image_module=Image)
     rows = _layout_rows_for_image(
         normalized_text,
         draw=measure_draw,
         fonts=fonts,
         max_width=max_text_width,
         inline_images=prepared_inline_images,
+        emoji_image_keys=set(prepared_emoji_images.keys()),
     )
     if not rows:
         rows = [{"kind": "spacer", "height": 24}]
@@ -6807,8 +6897,10 @@ async def _render_response_text_to_jpg_pages(
         content_height = sum(int(row.get("height", 0)) for row in page_rows)
         image_height = max(520, RESPONSE_IMAGE_MARGIN_Y * 2 + content_height)
 
-        image = Image.new("RGB", (page_width, image_height), color=RESPONSE_IMAGE_BG_COLOR)
+        image = Image.new("RGBA", (page_width, image_height), color=(*RESPONSE_IMAGE_BG_COLOR, 255))
         draw = ImageDraw.Draw(image)
+        emoji_resized_cache: dict[tuple[str, int], Any] = {}
+        fraction_image_cache: dict[tuple[str, str], Any] = {}
         y = RESPONSE_IMAGE_MARGIN_Y
 
         for row in page_rows:
@@ -6905,13 +6997,62 @@ async def _render_response_text_to_jpg_pages(
                         segment_text, font_key = segment
                         if not segment_text:
                             continue
-                        font = fonts.get(str(font_key), fonts["body"])
-                        draw.text((x, y), str(segment_text), font=font, fill=RESPONSE_IMAGE_TEXT_COLOR)
+                        font_key_str = str(font_key)
+                        emoji_base_key = _emoji_segment_base_font_key(font_key_str)
+                        if emoji_base_key is not None:
+                            emoji_size = _emoji_segment_pixel_size(draw, fonts=fonts, base_font_key=emoji_base_key)
+                            cached_key = (str(segment_text), emoji_size)
+                            emoji_img = emoji_resized_cache.get(cached_key)
+                            if emoji_img is None:
+                                source = prepared_emoji_images.get(str(segment_text))
+                                if source is not None:
+                                    emoji_img = source.resize((emoji_size, emoji_size), Image.Resampling.LANCZOS)
+                                emoji_resized_cache[cached_key] = emoji_img
+                            if emoji_img is not None:
+                                emoji_top = y + max(0, (row_height - emoji_size) // 2)
+                                image.paste(emoji_img, (x, emoji_top), emoji_img)
+                            x += emoji_size
+                            continue
+
+                        fraction_base_key = _fraction_segment_base_font_key(font_key_str)
+                        if fraction_base_key is not None:
+                            numerator, denominator = _decode_fraction_segment_payload(str(segment_text))
+                            if numerator and denominator:
+                                cache_key = (f"{numerator}{FRACTION_PAYLOAD_SEPARATOR}{denominator}", fraction_base_key)
+                                fraction_img = fraction_image_cache.get(cache_key)
+                                if fraction_img is None:
+                                    fraction_img = _build_inline_fraction_image(
+                                        numerator=numerator,
+                                        denominator=denominator,
+                                        base_font_key=fraction_base_key,
+                                        fonts=fonts,
+                                        image_module=Image,
+                                    )
+                                    fraction_image_cache[cache_key] = fraction_img
+                                if fraction_img is not None:
+                                    frac_h = int(fraction_img.height)
+                                    frac_w = int(fraction_img.width)
+                                    frac_top = y + max(0, (row_height - frac_h) // 2)
+                                    image.paste(fraction_img, (x, frac_top), fraction_img)
+                                    x += frac_w
+                                    continue
+
+                        font = fonts.get(font_key_str, fonts["body"])
+                        draw_kwargs: dict[str, Any] = {}
+                        if font_key_str == "emoji":
+                            draw_kwargs["embedded_color"] = True
+                        draw.text(
+                            (x, y),
+                            str(segment_text),
+                            font=font,
+                            fill=RESPONSE_IMAGE_TEXT_COLOR,
+                            **draw_kwargs,
+                        )
                         x += _measure_text_width(draw, str(segment_text), font)
             y += row_height
 
         output = BytesIO()
-        image.save(output, format="JPEG", quality=92, optimize=True)
+        image.convert("RGB").save(output, format="JPEG", quality=92, optimize=True)
         pages.append(
             BufferedInputFile(
                 output.getvalue(),
@@ -6927,9 +7068,246 @@ def _normalize_text_for_image(text: str) -> str:
     cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = cleaned.replace("\t", "    ")
     cleaned = cleaned.replace("```", "")
-    cleaned = re.sub(r"(?m)^\s*>\s?", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s*>\s?", "> ", cleaned)
     cleaned = re.sub(r"(?m)\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
+
+def _extract_markdown_tables_for_inline_render(text: str) -> tuple[str, list[list[list[str]]]]:
+    lines = text.split("\n")
+    output: list[str] = []
+    tables: list[list[list[str]]] = []
+    index = 0
+
+    while index < len(lines):
+        current = lines[index]
+        next_line = lines[index + 1] if index + 1 < len(lines) else ""
+        if _is_markdown_table_header_row(current) and _is_markdown_table_separator_row(next_line):
+            table_rows: list[list[str]] = [_split_markdown_table_row(current)]
+            index += 2
+            while index < len(lines) and _is_markdown_table_header_row(lines[index]):
+                table_rows.append(_split_markdown_table_row(lines[index]))
+                index += 1
+            token = f"[[INLINE_TABLE_{len(tables)}]]"
+            tables.append(table_rows)
+            output.append(token)
+            continue
+        output.append(current)
+        index += 1
+
+    return "\n".join(output), tables
+
+
+def _fit_table_column_widths(
+    widths: list[int],
+    *,
+    available_total: int,
+    min_col_width: int,
+) -> list[int]:
+    if not widths:
+        return []
+    col_count = len(widths)
+    if available_total <= 0:
+        return [min_col_width] * col_count
+
+    min_total = min_col_width * col_count
+    if min_total >= available_total:
+        base = max(64, available_total // col_count)
+        result = [base] * col_count
+        for idx in range(available_total - base * col_count):
+            result[idx % col_count] += 1
+        return result
+
+    current = list(widths)
+    current_total = sum(current)
+    if current_total <= available_total:
+        return current
+
+    overflow = current_total - available_total
+    shrinkable = [max(0, width - min_col_width) for width in current]
+    total_shrinkable = sum(shrinkable)
+    if total_shrinkable <= 0:
+        return [min_col_width] * col_count
+
+    for index in range(col_count):
+        if overflow <= 0:
+            break
+        max_reduce = shrinkable[index]
+        if max_reduce <= 0:
+            continue
+        portion = int(round(overflow * (max_reduce / total_shrinkable)))
+        reduce_by = max(1, min(max_reduce, portion))
+        current[index] -= reduce_by
+        overflow -= reduce_by
+
+    pointer = 0
+    while overflow > 0:
+        if current[pointer] > min_col_width:
+            current[pointer] -= 1
+            overflow -= 1
+        pointer = (pointer + 1) % col_count
+        if pointer == 0 and all(width <= min_col_width for width in current):
+            break
+    return current
+
+
+def _table_cell_text(raw: str) -> str:
+    cleaned, _, _ = _strip_bold_markers(raw)
+    text = cleaned.replace(r"\|", "|")
+    text = re.sub(r"\s+", " ", text.strip())
+    return text
+
+
+async def _render_markdown_table_to_png_bytes(
+    rows: list[list[str]],
+    *,
+    fonts: dict[str, Any],
+    max_table_width: int,
+) -> bytes | None:
+    if not rows:
+        return None
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:  # noqa: BLE001
+        return None
+
+    col_count = max(len(row) for row in rows)
+    normalized_rows: list[list[str]] = []
+    for row in rows:
+        current = [_table_cell_text(cell) for cell in row]
+        if len(current) < col_count:
+            current.extend([""] * (col_count - len(current)))
+        normalized_rows.append(current)
+    if not normalized_rows:
+        return None
+
+    measure_image = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    measure_draw = ImageDraw.Draw(measure_image)
+
+    border = RESPONSE_TABLE_BORDER_WIDTH
+    table_max_width = max(420, max_table_width)
+    available_total = table_max_width - border * (col_count + 1)
+    min_col_width = min(RESPONSE_TABLE_MIN_COL_WIDTH, max(90, available_total // max(1, col_count)))
+    max_col_width = min(RESPONSE_TABLE_MAX_COL_WIDTH, max(140, available_total))
+
+    initial_col_widths: list[int] = []
+    for col_idx in range(col_count):
+        max_content_width = 0
+        for row_idx, row in enumerate(normalized_rows):
+            text = row[col_idx]
+            font_key = "body_bold" if row_idx == 0 else "body"
+            font = fonts.get(font_key, fonts["body"])
+            width = _measure_text_width(measure_draw, text, font)
+            max_content_width = max(max_content_width, width)
+        cell_width = max_content_width + RESPONSE_TABLE_CELL_PADDING_X * 2
+        initial_col_widths.append(max(min_col_width, min(max_col_width, cell_width)))
+
+    col_widths = _fit_table_column_widths(
+        initial_col_widths,
+        available_total=available_total,
+        min_col_width=min_col_width,
+    )
+
+    emoji_source = "\n".join(" | ".join(row) for row in normalized_rows)
+    emoji_images = await _fetch_emoji_images_for_text(emoji_source)
+    prepared_emoji_images = _prepare_emoji_images_for_render(emoji_images, image_module=Image)
+    emoji_image_keys = set(prepared_emoji_images.keys())
+    emoji_resized_cache: dict[tuple[str, int], Any] = {}
+
+    wrapped_segments: list[list[list[list[tuple[str, str]]]]] = []
+    row_heights: list[int] = []
+    for row_idx, row in enumerate(normalized_rows):
+        row_cells: list[list[list[tuple[str, str]]]] = []
+        row_height = 0
+        font_key = "body_bold" if row_idx == 0 else "body"
+        font = fonts.get(font_key, fonts["body"])
+        line_height = _line_height_for_font(measure_draw, font, extra=2)
+        for col_idx, text in enumerate(row):
+            content_width = max(60, col_widths[col_idx] - RESPONSE_TABLE_CELL_PADDING_X * 2)
+            wrapped_lines = _wrap_text_to_width(text, draw=measure_draw, font=font, max_width=content_width)
+            if not wrapped_lines:
+                wrapped_lines = [""]
+            cell_lines: list[list[tuple[str, str]]] = []
+            for line in wrapped_lines:
+                cell_lines.append(
+                    _segments_for_image_text(
+                        line,
+                        font_key,
+                        fonts=fonts,
+                        emoji_image_keys=emoji_image_keys,
+                    )
+                )
+            row_cells.append(cell_lines)
+            cell_height = len(cell_lines) * line_height + RESPONSE_TABLE_CELL_PADDING_Y * 2
+            row_height = max(row_height, cell_height)
+        wrapped_segments.append(row_cells)
+        row_heights.append(max(52, row_height))
+
+    table_width = sum(col_widths) + border * (col_count + 1)
+    table_height = sum(row_heights) + border * (len(normalized_rows) + 1)
+    image = Image.new("RGBA", (table_width, table_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+
+    draw.rectangle(
+        (0, 0, table_width - 1, table_height - 1),
+        fill=RESPONSE_TABLE_BG_COLOR,
+        outline=RESPONSE_TABLE_BORDER_COLOR,
+        width=border,
+    )
+
+    y = border
+    for row_idx, row_cells in enumerate(wrapped_segments):
+        row_height = row_heights[row_idx]
+        x = border
+        for col_idx, cell_lines in enumerate(row_cells):
+            col_width = col_widths[col_idx]
+            is_header = row_idx == 0
+            fill_color = (
+                RESPONSE_TABLE_HEADER_BG_COLOR
+                if is_header
+                else (RESPONSE_TABLE_ROW_BG_ODD if row_idx % 2 else RESPONSE_TABLE_ROW_BG_EVEN)
+            )
+            draw.rectangle((x, y, x + col_width - 1, y + row_height - 1), fill=fill_color)
+
+            text_color = (237, 242, 255) if is_header else RESPONSE_IMAGE_TEXT_COLOR
+            font_key = "body_bold" if is_header else "body"
+            base_font = fonts.get(font_key, fonts["body"])
+            line_height = _line_height_for_font(draw, base_font, extra=2)
+            text_y = y + RESPONSE_TABLE_CELL_PADDING_Y
+
+            for segments in cell_lines:
+                text_x = x + RESPONSE_TABLE_CELL_PADDING_X
+                for segment_text, segment_font_key in segments:
+                    if not segment_text:
+                        continue
+                    seg_key = str(segment_font_key)
+                    emoji_base_key = _emoji_segment_base_font_key(seg_key)
+                    if emoji_base_key is not None:
+                        emoji_size = _emoji_segment_pixel_size(draw, fonts=fonts, base_font_key=emoji_base_key)
+                        cache_key = (str(segment_text), emoji_size)
+                        emoji_img = emoji_resized_cache.get(cache_key)
+                        if emoji_img is None:
+                            source = prepared_emoji_images.get(str(segment_text))
+                            if source is not None:
+                                emoji_img = source.resize((emoji_size, emoji_size), Image.Resampling.LANCZOS)
+                            emoji_resized_cache[cache_key] = emoji_img
+                        if emoji_img is not None:
+                            emoji_top = text_y + max(0, (line_height - emoji_size) // 2)
+                            image.paste(emoji_img, (text_x, emoji_top), emoji_img)
+                        text_x += emoji_size
+                        continue
+
+                    font = fonts.get(seg_key, base_font)
+                    draw.text((text_x, text_y), str(segment_text), font=font, fill=text_color)
+                    text_x += _measure_text_width(draw, str(segment_text), font)
+                text_y += line_height
+
+            x += col_width + border
+        y += row_height + border
+
+    output = BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
 
 
 def _normalize_markdown_tables_for_image(text: str) -> str:
@@ -7008,10 +7386,27 @@ def _render_table_block_for_image(rows: list[list[str]]) -> list[str]:
 
 
 def _truncate_for_table(value: str, *, limit: int = 28) -> str:
-    text = re.sub(r"\s+", " ", value.strip())
-    if len(text) <= limit:
+    cleaned, _, _ = _strip_bold_markers(value)
+    text = cleaned.replace(r"\|", "|")
+    text = re.sub(r"\s+", " ", text.strip())
+    width = wcswidth(text)
+    if width < 0:
+        width = len(text)
+    if width <= limit:
         return text
-    return text[: max(0, limit - 1)].rstrip() + "…"
+
+    target = max(0, limit - 1)
+    acc = 0
+    out_chars: list[str] = []
+    for ch in text:
+        ch_width = wcswidth(ch)
+        if ch_width < 0:
+            ch_width = 1
+        if acc + ch_width > target:
+            break
+        out_chars.append(ch)
+        acc += ch_width
+    return "".join(out_chars).rstrip() + "…"
 
 
 def _extract_inline_image_urls_from_response(text: str) -> tuple[str, list[str]]:
@@ -7082,6 +7477,106 @@ async def _fetch_inline_images_for_response(urls: list[str]) -> dict[int, bytes]
     return results
 
 
+def _cache_emoji_image(cluster: str, payload: bytes | None) -> None:
+    _EMOJI_IMAGE_CACHE[cluster] = payload
+    if len(_EMOJI_IMAGE_CACHE) <= RESPONSE_IMAGE_EMOJI_CACHE_MAX_ITEMS:
+        return
+    oldest = next(iter(_EMOJI_IMAGE_CACHE))
+    _EMOJI_IMAGE_CACHE.pop(oldest, None)
+
+
+def _emoji_to_twemoji_codepoints(cluster: str) -> str:
+    codepoints: list[str] = []
+    for ch in cluster:
+        cp = ord(ch)
+        # Variation selectors are omitted in Twemoji CDN filenames.
+        if cp in {0xFE0E, 0xFE0F}:
+            continue
+        codepoints.append(f"{cp:x}")
+    return "-".join(codepoints)
+
+
+def _extract_unique_emoji_clusters(text: str) -> list[str]:
+    value = text or ""
+    if not value:
+        return []
+    unique: list[str] = []
+    seen: set[str] = set()
+    for start, end in _emoji_cluster_spans(value):
+        cluster = value[start:end]
+        if cluster and cluster not in seen:
+            seen.add(cluster)
+            unique.append(cluster)
+    return unique
+
+
+async def _fetch_emoji_images_for_text(text: str) -> dict[str, bytes]:
+    clusters = _extract_unique_emoji_clusters(text)
+    if not clusters:
+        return {}
+
+    fetched: dict[str, bytes] = {}
+    to_fetch: list[tuple[str, str]] = []
+    for cluster in clusters:
+        cached = _EMOJI_IMAGE_CACHE.get(cluster, ...)
+        if cached is not ...:
+            if cached:
+                fetched[cluster] = cached
+            continue
+        codepoints = _emoji_to_twemoji_codepoints(cluster)
+        if not codepoints:
+            _cache_emoji_image(cluster, None)
+            continue
+        to_fetch.append((cluster, f"{TWEMOJI_CDN_BASE}/{codepoints}.png"))
+
+    if not to_fetch:
+        return fetched
+
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=RESPONSE_IMAGE_EMOJI_FETCH_TIMEOUT,
+    ) as client:
+        for cluster, url in to_fetch:
+            try:
+                response = await client.get(url, headers=EMOJI_HTTP_HEADERS)
+                response.raise_for_status()
+            except Exception:  # noqa: BLE001
+                _cache_emoji_image(cluster, None)
+                continue
+
+            content_type = (response.headers.get("content-type") or "").lower()
+            payload = response.content or b""
+            if (
+                not content_type.startswith("image/")
+                or not payload
+                or len(payload) > RESPONSE_IMAGE_EMOJI_MAX_BYTES
+            ):
+                _cache_emoji_image(cluster, None)
+                continue
+
+            _cache_emoji_image(cluster, payload)
+            fetched[cluster] = payload
+
+    return fetched
+
+
+def _prepare_emoji_images_for_render(
+    emoji_images: dict[str, bytes],
+    *,
+    image_module: Any,
+) -> dict[str, Any]:
+    prepared: dict[str, Any] = {}
+    for cluster, payload in emoji_images.items():
+        try:
+            image = image_module.open(BytesIO(payload)).convert("RGBA")
+        except Exception:  # noqa: BLE001
+            continue
+        if image.width <= 0 or image.height <= 0:
+            continue
+        prepared[cluster] = image
+    return prepared
+
+
 def _prepare_inline_images_for_render(
     inline_images: dict[int, bytes],
     *,
@@ -7123,6 +7618,10 @@ def _load_render_fonts(image_font_module: Any) -> dict[str, Any]:
         image_font_module,
         RESPONSE_IMAGE_BODY_SIZE,
         (
+            "/usr/share/fonts/truetype/noto/NotoSansDisplay-Regular.ttf",
+            "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Regular.ttf",
+            "/usr/share/fonts/truetype/roboto/Roboto-Regular.ttf",
+            "/usr/share/fonts/truetype/firacode/FiraSans-Regular.ttf",
             "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
             "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -7134,6 +7633,9 @@ def _load_render_fonts(image_font_module: Any) -> dict[str, Any]:
         image_font_module,
         RESPONSE_IMAGE_BODY_SIZE,
         (
+            "/usr/share/fonts/truetype/noto/NotoSansDisplay-Bold.ttf",
+            "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Bold.ttf",
+            "/usr/share/fonts/truetype/roboto/Roboto-Bold.ttf",
             "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
             "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -7145,6 +7647,8 @@ def _load_render_fonts(image_font_module: Any) -> dict[str, Any]:
         image_font_module,
         RESPONSE_IMAGE_BODY_SIZE,
         (
+            "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Italic.ttf",
+            "/usr/share/fonts/truetype/roboto/Roboto-Italic.ttf",
             "/usr/share/fonts/truetype/noto/NotoSans-Italic.ttf",
             "/usr/share/fonts/truetype/ubuntu/Ubuntu-RI.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
@@ -7156,6 +7660,8 @@ def _load_render_fonts(image_font_module: Any) -> dict[str, Any]:
         image_font_module,
         RESPONSE_IMAGE_BODY_SIZE,
         (
+            "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-BoldItalic.ttf",
+            "/usr/share/fonts/truetype/roboto/Roboto-BoldItalic.ttf",
             "/usr/share/fonts/truetype/noto/NotoSans-BoldItalic.ttf",
             "/usr/share/fonts/truetype/ubuntu/Ubuntu-BI.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
@@ -7187,6 +7693,8 @@ def _load_render_fonts(image_font_module: Any) -> dict[str, Any]:
         image_font_module,
         RESPONSE_IMAGE_BODY_SIZE,
         (
+            "/usr/share/fonts/truetype/noto/NotoSerifDisplay-Regular.ttf",
+            "/usr/share/fonts/truetype/libreoffice/LibertinusSerif-Regular.otf",
             "/usr/share/fonts/truetype/noto/NotoSerif-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationSerif-Regular.ttf",
@@ -7197,6 +7705,9 @@ def _load_render_fonts(image_font_module: Any) -> dict[str, Any]:
         image_font_module,
         RESPONSE_IMAGE_HEADING_SIZE,
         (
+            "/usr/share/fonts/truetype/noto/NotoSansDisplay-Bold.ttf",
+            "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Bold.ttf",
+            "/usr/share/fonts/truetype/roboto/Roboto-Bold.ttf",
             "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
             "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -7208,6 +7719,7 @@ def _load_render_fonts(image_font_module: Any) -> dict[str, Any]:
         image_font_module,
         RESPONSE_IMAGE_HEADING_SIZE,
         (
+            "/usr/share/fonts/truetype/noto/NotoSerifDisplay-Bold.ttf",
             "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationSerif-Bold.ttf",
@@ -7221,6 +7733,8 @@ def _load_render_fonts(image_font_module: Any) -> dict[str, Any]:
             "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
             "/usr/share/fonts/truetype/emoji/NotoColorEmoji.ttf",
             "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
+            "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
+            "/usr/share/fonts/truetype/symbola/Symbola.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         ),
     )
@@ -7263,7 +7777,7 @@ def _table_line_style(line: str, *, table_open: bool, header_rendered: bool) -> 
 
 
 def _contains_emoji_chars(text: str) -> bool:
-    return any(_is_emoji_char(ch) for ch in text)
+    return bool(_emoji_cluster_spans(text))
 
 
 def _is_emoji_char(ch: str) -> bool:
@@ -7273,42 +7787,195 @@ def _is_emoji_char(ch: str) -> bool:
         or 0x1F300 <= cp <= 0x1FAFF  # symbols and pictographs
         or 0x1F600 <= cp <= 0x1F64F  # emoticons
         or 0x2600 <= cp <= 0x27BF  # misc symbols + dingbats
+        or cp in {0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139, 0x3030, 0x303D, 0x3297, 0x3299}
     )
 
 
-def _segments_for_image_text(text: str, base_font_key: str, *, fonts: dict[str, Any]) -> list[tuple[str, str]]:
+def _consume_keycap_cluster(value: str, start: int) -> int | None:
+    if start >= len(value):
+        return None
+    if value[start] not in "0123456789#*":
+        return None
+    idx = start + 1
+    if idx < len(value) and ord(value[idx]) == 0xFE0F:
+        idx += 1
+    if idx < len(value) and ord(value[idx]) == 0x20E3:
+        return idx + 1
+    return None
+
+
+def _emoji_cluster_spans(value: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    idx = 0
+    length = len(value)
+    while idx < length:
+        keycap_end = _consume_keycap_cluster(value, idx)
+        if keycap_end is not None:
+            spans.append((idx, keycap_end))
+            idx = keycap_end
+            continue
+
+        ch = value[idx]
+        if not _is_emoji_char(ch):
+            idx += 1
+            continue
+
+        start = idx
+        idx += 1
+        while idx < length and (ord(value[idx]) in {0xFE0E, 0xFE0F} or 0x1F3FB <= ord(value[idx]) <= 0x1F3FF):
+            idx += 1
+
+        while idx + 1 < length and ord(value[idx]) == 0x200D:
+            next_char = value[idx + 1]
+            if not _is_emoji_char(next_char):
+                break
+            idx += 2
+            while idx < length and (ord(value[idx]) in {0xFE0E, 0xFE0F} or 0x1F3FB <= ord(value[idx]) <= 0x1F3FF):
+                idx += 1
+
+        spans.append((start, idx))
+    return spans
+
+
+def _matching_group_end(value: str, start: int) -> int | None:
+    if start >= len(value):
+        return None
+    opening = value[start]
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    closing = pairs.get(opening)
+    if closing is None:
+        return None
+    depth = 0
+    for idx in range(start, len(value)):
+        ch = value[idx]
+        if ch == opening:
+            depth += 1
+        elif ch == closing:
+            depth -= 1
+            if depth == 0:
+                return idx
+            if depth < 0:
+                return None
+    return None
+
+
+def _inline_fraction_spans(value: str) -> list[tuple[int, int, str, str]]:
+    spans: list[tuple[int, int, str, str]] = []
+    idx = 0
+    while idx < len(value):
+        if value[idx] not in "([{":
+            idx += 1
+            continue
+
+        left_end = _matching_group_end(value, idx)
+        if left_end is None:
+            idx += 1
+            continue
+
+        slash_idx = left_end + 1
+        while slash_idx < len(value) and value[slash_idx].isspace():
+            slash_idx += 1
+        if slash_idx >= len(value) or value[slash_idx] not in {"/", "⁄"}:
+            idx += 1
+            continue
+
+        right_start = slash_idx + 1
+        while right_start < len(value) and value[right_start].isspace():
+            right_start += 1
+        if right_start >= len(value) or value[right_start] not in "([{":
+            idx += 1
+            continue
+
+        right_end = _matching_group_end(value, right_start)
+        if right_end is None:
+            idx += 1
+            continue
+
+        numerator = _strip_outer_group(value[idx:left_end + 1].strip())
+        denominator = _strip_outer_group(value[right_start:right_end + 1].strip())
+        if numerator and denominator and len(numerator) <= 220 and len(denominator) <= 220:
+            spans.append((idx, right_end + 1, numerator, denominator))
+            idx = right_end + 1
+            continue
+
+        idx += 1
+    return spans
+
+
+def _append_text_segments_with_emoji(
+    *,
+    target: list[tuple[str, str]],
+    text: str,
+    base_font_key: str,
+    fonts: dict[str, Any],
+    emoji_image_keys: set[str] | None,
+) -> None:
+    if not text:
+        return
+    emoji_spans = _emoji_cluster_spans(text)
+    if not emoji_spans:
+        target.append((text, base_font_key))
+        return
+
+    cursor = 0
+    for start, end in emoji_spans:
+        if start > cursor:
+            target.append((text[cursor:start], base_font_key))
+        emoji_chunk = text[start:end]
+        if emoji_image_keys and emoji_chunk in emoji_image_keys:
+            target.append((emoji_chunk, f"{RESPONSE_IMAGE_EMOJI_SEGMENT_PREFIX}{base_font_key}"))
+        else:
+            emoji_font = "emoji" if "emoji" in fonts else base_font_key
+            target.append((emoji_chunk, emoji_font))
+        cursor = end
+    if cursor < len(text):
+        target.append((text[cursor:], base_font_key))
+
+
+def _segments_for_image_text(
+    text: str,
+    base_font_key: str,
+    *,
+    fonts: dict[str, Any],
+    emoji_image_keys: set[str] | None = None,
+) -> list[tuple[str, str]]:
     value = text or ""
     if not value:
         return [("", base_font_key)]
-    if not _contains_emoji_chars(value):
-        return [(value, base_font_key)]
+    fraction_spans = _inline_fraction_spans(value)
+    if not fraction_spans:
+        segments: list[tuple[str, str]] = []
+        _append_text_segments_with_emoji(
+            target=segments,
+            text=value,
+            base_font_key=base_font_key,
+            fonts=fonts,
+            emoji_image_keys=emoji_image_keys,
+        )
+        return segments or [(value, base_font_key)]
 
     segments: list[tuple[str, str]] = []
-    buffer: list[str] = []
-    i = 0
-    while i < len(value):
-        ch = value[i]
-        if _is_emoji_char(ch):
-            if buffer:
-                segments.append(("".join(buffer), base_font_key))
-                buffer = []
-            start = i
-            i += 1
-            while i < len(value) and (ord(value[i]) in {0xFE0E, 0xFE0F} or 0x1F3FB <= ord(value[i]) <= 0x1F3FF):
-                i += 1
-            while i + 1 < len(value) and ord(value[i]) == 0x200D and _is_emoji_char(value[i + 1]):
-                i += 2
-                while i < len(value) and (ord(value[i]) in {0xFE0E, 0xFE0F} or 0x1F3FB <= ord(value[i]) <= 0x1F3FF):
-                    i += 1
-            emoji_chunk = value[start:i]
-            emoji_font = "emoji" if "emoji" in fonts else base_font_key
-            segments.append((emoji_chunk, emoji_font))
-            continue
-        buffer.append(ch)
-        i += 1
-
-    if buffer:
-        segments.append(("".join(buffer), base_font_key))
+    cursor = 0
+    for start, end, numerator, denominator in fraction_spans:
+        if start > cursor:
+            _append_text_segments_with_emoji(
+                target=segments,
+                text=value[cursor:start],
+                base_font_key=base_font_key,
+                fonts=fonts,
+                emoji_image_keys=emoji_image_keys,
+            )
+        payload = f"{numerator}{FRACTION_PAYLOAD_SEPARATOR}{denominator}"
+        segments.append((payload, f"{RESPONSE_IMAGE_FRACTION_SEGMENT_PREFIX}{base_font_key}"))
+        cursor = end
+    if cursor < len(value):
+        _append_text_segments_with_emoji(
+            target=segments,
+            text=value[cursor:],
+            base_font_key=base_font_key,
+            fonts=fonts,
+            emoji_image_keys=emoji_image_keys,
+        )
     return segments or [(value, base_font_key)]
 
 
@@ -7319,11 +7986,20 @@ def _layout_rows_for_image(
     fonts: dict[str, Any],
     max_width: int,
     inline_images: dict[int, dict[str, Any]],
+    emoji_image_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     has_content = False
     table_open = False
     table_header_rendered = False
+
+    def _segments(line: str, font_key: str) -> list[tuple[str, str]]:
+        return _segments_for_image_text(
+            line,
+            font_key,
+            fonts=fonts,
+            emoji_image_keys=emoji_image_keys,
+        )
 
     for raw_line in text.split("\n"):
         line_info = _classify_image_line(raw_line)
@@ -7375,7 +8051,7 @@ def _layout_rows_for_image(
             rows.extend(
                 {
                     "kind": "text",
-                    "segments": _segments_for_image_text(line, heading_font_key, fonts=fonts),
+                    "segments": _segments(line, heading_font_key),
                     "x_offset": 0,
                     "height": row_height,
                 }
@@ -7397,7 +8073,7 @@ def _layout_rows_for_image(
             rows.extend(
                 {
                     "kind": "text",
-                    "segments": _segments_for_image_text(line, font_key, fonts=fonts),
+                    "segments": _segments(line, font_key),
                     "x_offset": 0,
                     "height": row_height,
                     "highlight": highlight,
@@ -7405,6 +8081,32 @@ def _layout_rows_for_image(
                 for line in wrapped
             )
             rows.append({"kind": "spacer", "height": 8})
+            has_content = True
+            continue
+
+        if kind == "quote":
+            quote_text, _, _ = _strip_bold_markers(str(line_info["text"]))
+            quote_text = quote_text.strip()
+            if not quote_text:
+                continue
+            wrapped = _wrap_text_to_width(
+                quote_text,
+                draw=draw,
+                font=fonts["serif"],
+                max_width=max_width - 30,
+            )
+            row_height = _line_height_for_font(draw, fonts["serif"], extra=6)
+            rows.extend(
+                {
+                    "kind": "text",
+                    "segments": _segments(f"❝ {line}" if idx == 0 else f"  {line}", "serif"),
+                    "x_offset": 12,
+                    "height": row_height,
+                    "highlight": True,
+                }
+                for idx, line in enumerate(wrapped)
+            )
+            rows.append({"kind": "spacer", "height": 6})
             has_content = True
             continue
 
@@ -7421,7 +8123,7 @@ def _layout_rows_for_image(
             rows.extend(
                 {
                     "kind": "text",
-                    "segments": _segments_for_image_text(line, "mono", fonts=fonts),
+                    "segments": _segments(line, "mono"),
                     "x_offset": 10,
                     "height": row_height,
                 }
@@ -7449,7 +8151,7 @@ def _layout_rows_for_image(
             rows.extend(
                 {
                     "kind": "text",
-                    "segments": _segments_for_image_text(line, table_font_key, fonts=fonts),
+                    "segments": _segments(line, table_font_key),
                     "x_offset": 7,
                     "height": row_height,
                     "table_style": table_style,
@@ -7466,21 +8168,43 @@ def _layout_rows_for_image(
             denominator_text = denominator_text.strip()
             if not numerator_text or not denominator_text:
                 continue
-            num_width = _measure_text_width(draw, numerator_text, fonts[numerator_font_key])
-            den_width = _measure_text_width(draw, denominator_text, fonts[denominator_font_key])
-            bar_width = min(max_width - 12, max(24, max(num_width, den_width) + 14))
-            center_offset = max(0, (max_width - bar_width) // 2)
-            numerator_offset = center_offset + max(0, (bar_width - num_width) // 2)
-            denominator_offset = center_offset + max(0, (bar_width - den_width) // 2)
-            rows.append(
-                {
-                    "kind": "text",
-                    "segments": _segments_for_image_text(numerator_text, numerator_font_key, fonts=fonts),
-                    "x_offset": numerator_offset,
-                    "height": _line_height_for_font(draw, fonts[numerator_font_key], extra=5),
-                    "highlight": numerator_highlight,
-                }
+            numerator_wrapped = _wrap_text_to_width(
+                numerator_text,
+                draw=draw,
+                font=fonts[numerator_font_key],
+                max_width=max_width - 24,
             )
+            denominator_wrapped = _wrap_text_to_width(
+                denominator_text,
+                draw=draw,
+                font=fonts[denominator_font_key],
+                max_width=max_width - 24,
+            )
+
+            numerator_width = 0
+            for item in numerator_wrapped:
+                numerator_width = max(numerator_width, _measure_text_width(draw, item, fonts[numerator_font_key]))
+            denominator_width = 0
+            for item in denominator_wrapped:
+                denominator_width = max(denominator_width, _measure_text_width(draw, item, fonts[denominator_font_key]))
+
+            bar_width = min(max_width - 12, max(48, max(numerator_width, denominator_width) + 18))
+            center_offset = max(0, (max_width - bar_width) // 2)
+
+            numerator_row_height = _line_height_for_font(draw, fonts[numerator_font_key], extra=5)
+            denominator_row_height = _line_height_for_font(draw, fonts[denominator_font_key], extra=5)
+            for item in numerator_wrapped:
+                item_width = _measure_text_width(draw, item, fonts[numerator_font_key])
+                item_offset = center_offset + max(0, (bar_width - item_width) // 2)
+                rows.append(
+                    {
+                        "kind": "text",
+                        "segments": _segments(item, numerator_font_key),
+                        "x_offset": item_offset,
+                        "height": numerator_row_height,
+                        "highlight": numerator_highlight,
+                    }
+                )
             rows.append(
                 {
                     "kind": "fraction_rule",
@@ -7489,15 +8213,18 @@ def _layout_rows_for_image(
                     "height": 10,
                 }
             )
-            rows.append(
-                {
-                    "kind": "text",
-                    "segments": _segments_for_image_text(denominator_text, denominator_font_key, fonts=fonts),
-                    "x_offset": denominator_offset,
-                    "height": _line_height_for_font(draw, fonts[denominator_font_key], extra=5),
-                    "highlight": denominator_highlight,
-                }
-            )
+            for item in denominator_wrapped:
+                item_width = _measure_text_width(draw, item, fonts[denominator_font_key])
+                item_offset = center_offset + max(0, (bar_width - item_width) // 2)
+                rows.append(
+                    {
+                        "kind": "text",
+                        "segments": _segments(item, denominator_font_key),
+                        "x_offset": item_offset,
+                        "height": denominator_row_height,
+                        "highlight": denominator_highlight,
+                    }
+                )
             rows.append({"kind": "spacer", "height": 6})
             has_content = True
             continue
@@ -7516,7 +8243,7 @@ def _layout_rows_for_image(
             rows.extend(
                 {
                     "kind": "text",
-                    "segments": _segments_for_image_text(line, bullet_font_key, fonts=fonts),
+                    "segments": _segments(line, bullet_font_key),
                     "x_offset": base_indent,
                     "height": row_height,
                     "highlight": bullet_highlight,
@@ -7539,7 +8266,7 @@ def _layout_rows_for_image(
             rows.extend(
                 {
                     "kind": "text",
-                    "segments": _segments_for_image_text(line, font_key, fonts=fonts),
+                    "segments": _segments(line, font_key),
                     "x_offset": int(line_info.get("indent", 0)) * 4,
                     "height": row_height,
                     "highlight": number_highlight,
@@ -7560,7 +8287,7 @@ def _layout_rows_for_image(
         rows.extend(
             {
                 "kind": "text",
-                "segments": _segments_for_image_text(line, paragraph_font_key, fonts=fonts),
+                "segments": _segments(line, paragraph_font_key),
                 "x_offset": 0,
                 "height": row_height,
                 "highlight": paragraph_highlight,
@@ -7590,6 +8317,10 @@ def _classify_image_line(raw_line: str) -> dict[str, Any]:
     heading_match = re.match(r"^\s{0,3}(#{1,6})\s+(.*)$", line)
     if heading_match:
         return {"kind": "heading", "text": heading_match.group(2).strip()}
+
+    quote_match = re.match(r"^\s*>\s?(.*)$", line)
+    if quote_match:
+        return {"kind": "quote", "text": quote_match.group(1).strip()}
 
     if re.match(r"^\d+\.\s+\S", stripped) and len(stripped) <= 140:
         return {"kind": "section", "text": stripped}
@@ -7636,29 +8367,92 @@ def _extract_fraction_parts_from_line(line: str) -> tuple[str, str] | None:
     lowered = value.lower()
     if "http://" in lowered or "https://" in lowered:
         return None
-
-    separator = "⁄" if value.count("⁄") == 1 else ("/" if value.count("/") == 1 else None)
-    if separator is None:
-        return None
-    if len(value) > 170:
+    if len(value) > 420:
         return None
 
-    left, right = value.split(separator, maxsplit=1)
-    left = left.strip()
-    right = right.strip()
+    parts = _split_top_level_fraction(value)
+    if parts is None:
+        return None
+    left, right = parts
+    left = _strip_outer_group(left.strip())
+    right = _strip_outer_group(right.strip())
     if not left or not right:
         return None
 
-    if left.startswith("(") and left.endswith(")") and len(left) > 2:
-        left = left[1:-1].strip()
-    if right.startswith("(") and right.endswith(")") and len(right) > 2:
-        right = right[1:-1].strip()
-    if not left or not right:
-        return None
-
-    if len(left) > 80 or len(right) > 80:
+    if len(left) > 220 or len(right) > 220:
         return None
     return left, right
+
+
+def _split_top_level_fraction(value: str) -> tuple[str, str] | None:
+    depth_paren = 0
+    depth_bracket = 0
+    depth_brace = 0
+    sep_index: int | None = None
+
+    for idx, ch in enumerate(value):
+        if ch == "(":
+            depth_paren += 1
+            continue
+        if ch == ")":
+            depth_paren = max(0, depth_paren - 1)
+            continue
+        if ch == "[":
+            depth_bracket += 1
+            continue
+        if ch == "]":
+            depth_bracket = max(0, depth_bracket - 1)
+            continue
+        if ch == "{":
+            depth_brace += 1
+            continue
+        if ch == "}":
+            depth_brace = max(0, depth_brace - 1)
+            continue
+        if ch not in {"/", "⁄"}:
+            continue
+        if depth_paren or depth_bracket or depth_brace:
+            continue
+        if sep_index is not None:
+            # More than one top-level slash: not a single fraction.
+            return None
+        sep_index = idx
+
+    if sep_index is None:
+        return None
+    left = value[:sep_index]
+    right = value[sep_index + 1:]
+    if not left.strip() or not right.strip():
+        return None
+    return left, right
+
+
+def _strip_outer_group(value: str) -> str:
+    current = value.strip()
+    while len(current) >= 2:
+        first = current[0]
+        last = current[-1]
+        pair = (first, last)
+        if pair not in {("(", ")"), ("[", "]"), ("{", "}")}:
+            break
+        if not _is_single_wrapping_group(current, opening=first, closing=last):
+            break
+        current = current[1:-1].strip()
+    return current
+
+
+def _is_single_wrapping_group(value: str, *, opening: str, closing: str) -> bool:
+    depth = 0
+    for idx, ch in enumerate(value):
+        if ch == opening:
+            depth += 1
+        elif ch == closing:
+            depth -= 1
+            if depth < 0:
+                return False
+            if depth == 0 and idx != len(value) - 1:
+                return False
+    return depth == 0
 
 
 def _last_non_spacer_kind(rows: list[dict[str, Any]]) -> str | None:
@@ -7777,6 +8571,70 @@ def _measure_text_width(draw: Any, text: str, font: Any) -> int:
     return max(0, bbox[2] - bbox[0])
 
 
+def _emoji_segment_base_font_key(font_key: str) -> str | None:
+    if not font_key.startswith(RESPONSE_IMAGE_EMOJI_SEGMENT_PREFIX):
+        return None
+    base_font_key = font_key[len(RESPONSE_IMAGE_EMOJI_SEGMENT_PREFIX):].strip()
+    return base_font_key or "body"
+
+
+def _fraction_segment_base_font_key(font_key: str) -> str | None:
+    if not font_key.startswith(RESPONSE_IMAGE_FRACTION_SEGMENT_PREFIX):
+        return None
+    base_font_key = font_key[len(RESPONSE_IMAGE_FRACTION_SEGMENT_PREFIX):].strip()
+    return base_font_key or "body"
+
+
+def _decode_fraction_segment_payload(payload: str) -> tuple[str, str]:
+    if FRACTION_PAYLOAD_SEPARATOR not in payload:
+        return "", ""
+    numerator, denominator = payload.split(FRACTION_PAYLOAD_SEPARATOR, maxsplit=1)
+    return numerator.strip(), denominator.strip()
+
+
+def _build_inline_fraction_image(
+    *,
+    numerator: str,
+    denominator: str,
+    base_font_key: str,
+    fonts: dict[str, Any],
+    image_module: Any,
+) -> Any | None:
+    if not numerator or not denominator:
+        return None
+    try:
+        from PIL import ImageDraw
+    except Exception:  # noqa: BLE001
+        return None
+
+    font = fonts.get(base_font_key, fonts["body"])
+    measure = image_module.new("RGBA", (1, 1), (0, 0, 0, 0))
+    measure_draw = ImageDraw.Draw(measure)
+    num_width = _measure_text_width(measure_draw, numerator, font)
+    den_width = _measure_text_width(measure_draw, denominator, font)
+    line_height = max(14, _line_height_for_font(measure_draw, font, extra=0))
+    width = max(28, max(num_width, den_width) + 14)
+    height = max(26, line_height * 2 + 6)
+
+    image = image_module.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    num_x = max(0, (width - num_width) // 2)
+    den_x = max(0, (width - den_width) // 2)
+    num_y = 0
+    line_y = line_height + 1
+    den_y = line_height + 3
+    draw.text((num_x, num_y), numerator, font=font, fill=RESPONSE_IMAGE_TEXT_COLOR)
+    draw.line((3, line_y, width - 3, line_y), fill=RESPONSE_IMAGE_TEXT_COLOR, width=2)
+    draw.text((den_x, den_y), denominator, font=font, fill=RESPONSE_IMAGE_TEXT_COLOR)
+    return image
+
+
+def _emoji_segment_pixel_size(draw: Any, *, fonts: dict[str, Any], base_font_key: str) -> int:
+    font = fonts.get(base_font_key, fonts["body"])
+    text_height = _line_height_for_font(draw, font, extra=0)
+    return max(16, min(72, text_height))
+
+
 def _segments_text_width(draw: Any, segments: Any, fonts: dict[str, Any]) -> int:
     if not isinstance(segments, list):
         return 0
@@ -7787,7 +8645,21 @@ def _segments_text_width(draw: Any, segments: Any, fonts: dict[str, Any]) -> int
         text, font_key = segment
         if not text:
             continue
-        font = fonts.get(str(font_key), fonts["body"])
+        font_key_str = str(font_key)
+        emoji_base_key = _emoji_segment_base_font_key(font_key_str)
+        if emoji_base_key is not None:
+            total += _emoji_segment_pixel_size(draw, fonts=fonts, base_font_key=emoji_base_key)
+            continue
+        fraction_base_key = _fraction_segment_base_font_key(font_key_str)
+        if fraction_base_key is not None:
+            numerator, denominator = _decode_fraction_segment_payload(str(text))
+            if numerator and denominator:
+                font = fonts.get(fraction_base_key, fonts["body"])
+                num_width = _measure_text_width(draw, numerator, font)
+                den_width = _measure_text_width(draw, denominator, font)
+                total += max(28, max(num_width, den_width) + 14)
+                continue
+        font = fonts.get(font_key_str, fonts["body"])
         total += _measure_text_width(draw, str(text), font)
     return total
 
@@ -8029,6 +8901,8 @@ def _guess_provider_from_key(api_key: str) -> str | None:
         return "groq"
     if token.startswith("sk-or-v1-"):
         return "openrouter"
+    if token.startswith("AIza"):
+        return "google"
     if token.startswith("sk-"):
         return "openai"
     if token.startswith("together_"):

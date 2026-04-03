@@ -48,6 +48,12 @@ PROVIDERS: dict[str, Provider] = {
         default_model="meta-llama/Meta-Llama-3.1-8B-Instruct",
         base_url="https://api.deepinfra.com/v1/openai",
     ),
+    "google": Provider(
+        id="google",
+        title="Google AI Studio",
+        default_model="gemini-2.0-flash",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    ),
     "custom": Provider(
         id="custom",
         title="Custom OpenAI-compatible",
@@ -63,6 +69,7 @@ PROVIDER_ICONS: dict[str, str] = {
     "openrouter": "🛰️",
     "together": "🤝",
     "deepinfra": "🧬",
+    "google": "🔷",
     "custom": "🛠️",
 }
 

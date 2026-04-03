@@ -187,10 +187,12 @@ def test_llm_markdown_rendering():
     print("TEST 5: LLM Markdown Rendering")
     print("=" * 70)
 
-    text = """**Bold title**
+    text = """# Bold title
 Regular text (with symbols).
 * list item one
   * list item two
+_italic_ and ~~strike~~ with [docs](https://example.com/path).
+> quoted line
 
 ```python
 value = 5 * 2
@@ -202,19 +204,44 @@ This is **important**.
     print(f"Input:  {repr(text)}")
     print(f"Output: {repr(rendered)}")
 
-    assert "*Bold title*" in rendered, "Double-asterisk bold should convert to Telegram bold"
+    assert "*Bold title*" in rendered, "Heading should convert to Telegram bold"
     assert "*important*" in rendered, "Inline bold should convert to Telegram bold"
     assert "\\(with symbols\\)\\." in rendered, "Regular text must remain escaped"
     assert "◦ list item one" in rendered, "Single-star list item should convert to bullet"
     assert "  ◦ list item two" in rendered, "Indented single-star list item should convert to bullet"
+    assert "_italic_" in rendered, "Italic markdown should be preserved"
+    assert "~strike~" in rendered, "Strikethrough markdown should be preserved"
+    assert "[docs](https://example.com/path)" in rendered, "Markdown links should be preserved"
+    assert "❝ quoted line" in rendered, "Blockquote should be normalized"
     assert "value = 5 * 2" in rendered, "Code block content should be preserved"
     print("✅ PASS: LLM markdown rendered safely for Telegram\n")
 
 
-def test_all_special_characters():
-    """Test all 21 special characters that need escaping."""
+def test_markdown_table_rendering():
+    """Test markdown table conversion into readable Telegram-safe block."""
     print("=" * 70)
-    print("TEST 6: All 21 Special MarkdownV2 Characters")
+    print("TEST 6: Markdown Table Rendering")
+    print("=" * 70)
+
+    text = """| Категория | Значение 1 | Значение 2 |
+| --- | ---: | --- |
+| Пункт 1 | 10 | 20 |
+| Пункт 2 | 30 | 40 |
+"""
+    rendered = render_llm_markdown_v2(text)
+    print(f"Input:  {repr(text)}")
+    print(f"Output: {repr(rendered)}")
+
+    assert "```text" in rendered, "Table should be wrapped in fenced text block"
+    assert "┌" in rendered and "└" in rendered, "Box table borders should be present"
+    assert "Категория" in rendered and "Пункт 1" in rendered, "Table content should be preserved"
+    print("✅ PASS: Markdown table converted to readable Telegram-safe table\n")
+
+
+def test_all_special_characters():
+    """Test all MarkdownV2 special characters that need escaping."""
+    print("=" * 70)
+    print("TEST 7: All MarkdownV2 Special Characters")
     print("=" * 70)
     
     # All characters that need escaping
@@ -229,7 +256,7 @@ def test_all_special_characters():
         status = "✅" if escaped == expected else "❌"
         print(f"{status} {i:2d}. '{char}' → {repr(escaped)}")
     
-    print("\n✅ PASS: All 21 characters correctly escaped")
+    print("\n✅ PASS: All MarkdownV2 special characters correctly escaped")
 
 
 def print_summary():
@@ -241,7 +268,7 @@ def print_summary():
 ✅ All tests passed!
 
 The MarkdownV2 escaping implementation correctly:
-  1. Escapes all 21 special characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
+  1. Escapes all MarkdownV2 special characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
   2. Preserves code blocks without internal escaping
   3. Handles multiple code blocks in one message
   4. Provides formatting helpers (bold, italic, code, etc.)
@@ -258,6 +285,7 @@ def main():
         test_formatting_functions()
         test_real_world_scenarios()
         test_llm_markdown_rendering()
+        test_markdown_table_rendering()
         test_all_special_characters()
         print_summary()
         return 0
