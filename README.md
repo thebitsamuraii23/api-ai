@@ -35,7 +35,7 @@ Production-ready Telegram AI bot with per-user provider settings, per-user model
   - independent provider selection
   - independent API key
   - independent model and personality
-- Shared AI mode with token quota controls.
+- UrAI mode with token quota controls.
 - Personal API mode with user-owned credentials.
 - Built-in chat memory and chat history navigation.
 - Media-ready flow (text, images, voice, files).
@@ -113,7 +113,7 @@ flowchart LR
 
 - Python 3.10+
 - Telegram bot token from BotFather
-- Optional provider API keys (per user or shared mode)
+- Optional provider API keys (per user or UrAI mode)
 
 ## Quick Start
 
@@ -166,7 +166,7 @@ Important optional settings:
 - `/provider` - choose provider
 - `/apikey` - set session API key for active provider
 - `/deletekey` - delete session API key for active provider
-- `/model` - set model or shared model preset
+- `/model` - set model or UrAI model preset
 - `/baseurl` - set custom provider base URL
 - `/personality` - select assistant persona
 - `/tokens` or `/limit` - view token status

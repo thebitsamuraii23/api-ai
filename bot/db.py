@@ -21,6 +21,7 @@ class UserSettings:
     active_chat_id: int | None
     use_personal_api: bool
     quota_used: int
+    realtime_answers_enabled: bool
 
 
 @dataclass(slots=True)
@@ -81,6 +82,7 @@ class Database:
                     language_confirmed INTEGER NOT NULL DEFAULT 0,
                     use_personal_api INTEGER NOT NULL DEFAULT 0,
                     quota_used INTEGER NOT NULL DEFAULT 0,
+                    realtime_answers_enabled INTEGER NOT NULL DEFAULT 1,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
@@ -99,6 +101,11 @@ class Database:
                 await conn.execute("ALTER TABLE users ADD COLUMN use_personal_api INTEGER NOT NULL DEFAULT 0")
             if not await self._column_exists(conn, "users", "quota_used"):
                 await conn.execute("ALTER TABLE users ADD COLUMN quota_used INTEGER NOT NULL DEFAULT 0")
+            if not await self._column_exists(conn, "users", "realtime_answers_enabled"):
+                await conn.execute("ALTER TABLE users ADD COLUMN realtime_answers_enabled INTEGER NOT NULL DEFAULT 1")
+            await conn.execute(
+                "UPDATE users SET realtime_answers_enabled = COALESCE(realtime_answers_enabled, 1)"
+            )
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS api_keys (
@@ -190,7 +197,8 @@ class Database:
                     custom_base_url,
                     active_chat_id,
                     use_personal_api,
-                    quota_used
+                    quota_used,
+                    realtime_answers_enabled
                 FROM users
                 WHERE user_id = ?
                 """,
@@ -209,6 +217,7 @@ class Database:
                 active_chat_id=None,
                 use_personal_api=False,
                 quota_used=0,
+                realtime_answers_enabled=True,
             )
         return UserSettings(
             user_id=row["user_id"],
@@ -221,6 +230,7 @@ class Database:
             active_chat_id=row["active_chat_id"],
             use_personal_api=bool(row["use_personal_api"]),
             quota_used=int(row["quota_used"] or 0),
+            realtime_answers_enabled=bool(row["realtime_answers_enabled"]),
         )
 
     async def set_language(self, user_id: int, language: str, *, confirmed: bool = True) -> None:
@@ -258,6 +268,10 @@ class Database:
         await self.ensure_user(user_id)
         value = max(0, int(quota_used))
         await self._set_user_field(user_id, "quota_used", value)
+
+    async def set_realtime_answers_enabled(self, user_id: int, enabled: bool) -> None:
+        await self.ensure_user(user_id)
+        await self._set_user_field(user_id, "realtime_answers_enabled", int(enabled))
 
     async def add_quota_used(self, user_id: int, delta: int) -> None:
         await self.ensure_user(user_id)

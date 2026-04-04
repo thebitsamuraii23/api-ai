@@ -109,27 +109,27 @@ TEXTS: dict[str, dict[str, str]] = {
         "api_key_removed": "🗑️ API key deleted for {provider}.",
         "ask_model": "🧠 Send model name (example: gpt-4o-mini).",
         "model_saved": "✅ Model set: {model}",
-        "choose_model_preset": "🧠 Choose model for shared AI:",
-        "model_preset_changed": "✅ Shared AI model set: {model}",
+        "choose_model_preset": "🧠 Choose model for UrAI:",
+        "model_preset_changed": "✅ UrAI model set: {model}",
         "model_personal_api_enabled": (
             "🔐 Personal API mode enabled.\n"
             "Now use /apikey for your own key and /model for manual model name."
         ),
         "model_personal_api_missing_key": "⚠️ Personal API mode is enabled, but your key is missing. Use /apikey.",
-        "shared_quota_exceeded": "⚠️ You reached your shared quota ({limit} tokens). Switch to Own API or wait for reset.",
+        "shared_quota_exceeded": "⚠️ You reached your UrAI quota ({limit} tokens). Switch to Own API or wait for reset.",
         "shared_quota_low_warning": (
             "⚠️ Low token balance: {remaining} left.\n"
             "To avoid interruption, switch to Own API mode or monitor usage via /limit."
         ),
-        "shared_ai_not_configured": "⚠️ Shared AI is temporarily unavailable. Contact admin.",
-        "access_mode_shared": "Shared AI",
+        "shared_ai_not_configured": "⚠️ UrAI is temporarily unavailable. Contact admin.",
+        "access_mode_shared": "UrAI",
         "access_mode_personal": "Own API",
         "model_gpt4": "GPT 4",
         "model_llama3": "LLaMA 3",
         "model_groq_compound": "Groq Compound",
         "model_llama4_media": "LLaMA 4 (Media)",
         "btn_own_api": "🔐 Own API",
-        "btn_use_bot_ai": "Use Bot's AI (With limits)",
+        "btn_use_bot_ai": "Use UrAI (With limits)",
         "ask_base_url": "🔗 Send API base URL (example: https://api.example.com/v1)",
         "base_url_saved": "✅ Base URL saved: {base_url}",
         "custom_base_url_required": "⚠️ Custom provider requires /baseurl before chat.",
@@ -145,19 +145,22 @@ TEXTS: dict[str, dict[str, str]] = {
             "🔐 API key: {has_key}\n"
             "🧮 Tokens left: {tokens_left}"
         ),
+        "realtime_answers_on": "ON",
+        "realtime_answers_off": "OFF",
+        "realtime_answers_toggled": "✅ Real-time answers: {status}",
         "limit_shared": (
             "🪙 Token balance\n"
-            "{status} Shared AI quota\n"
+            "{status} UrAI quota\n"
             "📊 Used: {used} / {limit} ({percent}%)\n"
             "💎 Available: {remaining}\n"
             "{bar}\n"
-            "🗓️ Shared AI quota resets every month."
+            "🗓️ UrAI quota resets every month."
         ),
         "limit_personal": (
             "🔐 Own API mode\n"
             "🌟 Bot token quota doesn't apply here\n"
             "🪙 Available tokens: ∞\n"
-            "🗓️ Shared AI quota resets every month."
+            "🗓️ UrAI quota resets every month."
         ),
         "history_cleared": "🗑️ History cleared.",
         "new_chat_started": "🆕 New chat started.",
@@ -318,27 +321,27 @@ TEXTS: dict[str, dict[str, str]] = {
         "api_key_removed": "🗑️ API-ключ удалён для {provider}.",
         "ask_model": "🧠 Отправьте имя модели (пример: gpt-4o-mini).",
         "model_saved": "✅ Модель установлена: {model}",
-        "choose_model_preset": "🧠 Выберите модель моего ИИ:",
-        "model_preset_changed": "✅ Модель моего ИИ изменена: {model}",
+        "choose_model_preset": "🧠 Выберите модель UrAI:",
+        "model_preset_changed": "✅ Модель UrAI изменена: {model}",
         "model_personal_api_enabled": (
             "🔐 Режим своего API включён.\n"
             "Теперь используйте /apikey для своего ключа и /model для ввода имени модели."
         ),
         "model_personal_api_missing_key": "⚠️ Включён режим своего API, но ключ не задан. Используйте /apikey.",
-        "shared_quota_exceeded": "⚠️ Вы израсходовали лимит общего ИИ ({limit} токенов). Переключитесь на Свой API.",
+        "shared_quota_exceeded": "⚠️ Вы израсходовали лимит UrAI ({limit} токенов). Переключитесь на Свой API.",
         "shared_quota_low_warning": (
             "⚠️ У вас мало токенов: осталось {remaining}.\n"
             "Чтобы не прерывать работу, переключитесь на Свой API или проверьте остаток через /limit."
         ),
-        "shared_ai_not_configured": "⚠️ Общий ИИ временно недоступен. Свяжитесь с админом.",
-        "access_mode_shared": "Мой ИИ",
+        "shared_ai_not_configured": "⚠️ UrAI временно недоступен. Свяжитесь с админом.",
+        "access_mode_shared": "UrAI",
         "access_mode_personal": "Свой API",
         "model_gpt4": "GPT 4",
         "model_llama3": "LLaMA 3",
         "model_groq_compound": "Groq Compound",
         "model_llama4_media": "LLaMA 4 (Media)",
         "btn_own_api": "🔐 Свой API",
-        "btn_use_bot_ai": "Use Bot's AI (With limits)",
+        "btn_use_bot_ai": "Use UrAI (With limits)",
         "ask_base_url": "🔗 Отправьте базовый URL API (пример: https://api.example.com/v1)",
         "base_url_saved": "✅ Base URL сохранён: {base_url}",
         "custom_base_url_required": "⚠️ Для custom-провайдера перед чатом нужен /baseurl.",
@@ -354,19 +357,22 @@ TEXTS: dict[str, dict[str, str]] = {
             "🔐 API-ключ: {has_key}\n"
             "🧮 Остаток токенов: {tokens_left}"
         ),
+        "realtime_answers_on": "ВКЛ",
+        "realtime_answers_off": "ВЫКЛ",
+        "realtime_answers_toggled": "✅ Ответы в реальном времени: {status}",
         "limit_shared": (
             "🪙 Баланс токенов\n"
-            "{status} Квота моего ИИ\n"
+            "{status} Квота UrAI\n"
             "📊 Использовано: {used} / {limit} ({percent}%)\n"
             "💎 Доступно: {remaining}\n"
             "{bar}\n"
-            "🗓️ Квота моего ИИ обновляется каждый месяц."
+            "🗓️ Квота UrAI обновляется каждый месяц."
         ),
         "limit_personal": (
             "🔐 Режим Свой API\n"
             "🌟 Лимит токенов бота здесь не применяется\n"
             "🪙 Доступно токенов: ∞\n"
-            "🗓️ Квота моего ИИ обновляется каждый месяц."
+            "🗓️ Квота UrAI обновляется каждый месяц."
         ),
         "history_cleared": "🗑️ История очищена.",
         "new_chat_started": "🆕 Начат новый чат.",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import AsyncIterator
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -168,6 +169,89 @@ class LLMService:
                 except Exception:  # noqa: BLE001
                     pass
 
+    async def generate_reply_stream(
+        self,
+        *,
+        provider_id: str,
+        api_key: str,
+        model: str | None,
+        messages: list[dict[str, Any]],
+        custom_base_url: str | None = None,
+        enable_web_search: bool = False,
+        web_search_tool_choice: str = "auto",
+        temperature: float = 0.7,
+    ) -> AsyncIterator[str]:
+        provider = PROVIDERS.get(provider_id)
+        if not provider:
+            raise LLMServiceError(f"Unsupported provider: {provider_id}")
+
+        base_url = custom_base_url if provider_id == "custom" else provider.base_url
+        if provider_id == "custom" and not base_url:
+            raise LLMServiceError("Custom provider requires base URL")
+
+        chosen_model = (model or "").strip() or provider.default_model
+
+        async with self._request_semaphore:
+            client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            emitted_any = False
+            try:
+                if (
+                    enable_web_search
+                    and web_search_tool_choice != "none"
+                    and self._supports_openai_responses(provider_id=provider_id, base_url=base_url)
+                ):
+                    try:
+                        async with client.responses.stream(
+                            model=chosen_model,
+                            input=self._to_responses_input(messages),
+                            tools=[{"type": "web_search"}],
+                            tool_choice=web_search_tool_choice,
+                            temperature=temperature,
+                        ) as stream:
+                            async for event in stream:
+                                if getattr(event, "type", "") != "response.output_text.delta":
+                                    continue
+                                delta = getattr(event, "delta", "")
+                                if not delta:
+                                    continue
+                                emitted_any = True
+                                yield str(delta)
+                    except Exception as exc:  # noqa: BLE001
+                        lowered = str(exc).lower()
+                        if "web_search" not in lowered and "tool" not in lowered:
+                            raise
+
+                if not emitted_any:
+                    stream = await client.chat.completions.create(
+                        model=chosen_model,
+                        messages=messages,
+                        temperature=temperature,
+                        stream=True,
+                    )
+                    async for chunk in stream:
+                        for delta in self._extract_chat_stream_deltas(chunk):
+                            emitted_any = True
+                            yield delta
+
+                if not emitted_any:
+                    completion = await client.chat.completions.create(
+                        model=chosen_model,
+                        messages=messages,
+                        temperature=temperature,
+                    )
+                    choice = completion.choices[0]
+                    content = self._extract_content(choice.message.content)
+                    if not content:
+                        raise LLMServiceError("Provider returned empty response")
+                    yield content
+            except Exception as exc:  # noqa: BLE001
+                raise LLMServiceError(str(exc)) from exc
+            finally:
+                try:
+                    await client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
     async def transcribe_audio(
         self,
         *,
@@ -237,3 +321,31 @@ class LLMService:
                     chunks.append(str(item["text"]))
             return "\n".join(chunks).strip()
         return str(content)
+
+    @staticmethod
+    def _extract_chat_stream_deltas(chunk: Any) -> list[str]:
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            return []
+        delta = getattr(choices[0], "delta", None)
+        if delta is None:
+            return []
+
+        content = getattr(delta, "content", None)
+        if content is None:
+            return []
+        if isinstance(content, str):
+            return [content]
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                text = getattr(item, "text", None)
+                if text:
+                    parts.append(str(text))
+                    continue
+                if isinstance(item, dict):
+                    value = item.get("text")
+                    if value:
+                        parts.append(str(value))
+            return parts
+        return []

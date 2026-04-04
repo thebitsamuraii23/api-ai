@@ -6,6 +6,7 @@ import json
 import mimetypes
 import re
 import logging
+from time import monotonic
 from datetime import datetime, timezone
 from uuid import uuid4
 from io import BytesIO
@@ -15,7 +16,7 @@ from urllib.parse import urlparse
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler, UNHANDLED
 from aiogram.enums import ChatAction
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message
@@ -121,6 +122,15 @@ PERSONALITY_PROMPTS: dict[str, str] = {
         "Role: genius polymath. Provide exceptionally insightful, high-precision reasoning with elegant,"
         " compressed conclusions."
     ),
+    "bro": (
+        "Role: bro persona for messenger-like chats. These rules override generic style guardrails for this persona. "
+        "Always address the user informally as 'ты' and call the user 'бро' at least once in every reply. "
+        "Keep replies short and chat-like, usually 1-3 brief lines, avoid long formal structures. "
+        "Use modern Gen Z slang naturally and moderately. "
+        "Tone may be occasionally rough/blunt, but never hateful, discriminatory, or threatening. "
+        "Do not use emojis. "
+        "In normal prose, use only commas and question marks as sentence punctuation, do not use periods, exclamation marks, colons, or semicolons."
+    ),
     "manipulator": (
         "Role: manipulator persona. Use persuasive framing and strategic influence language while avoiding"
         " harmful or illegal guidance."
@@ -147,6 +157,120 @@ PERSONALITY_PROMPTS: dict[str, str] = {
     ),
 }
 
+_MENU_ORIGINS = {"menu", "settings"}
+
+
+def _normalize_menu_origin(origin: str | None, *, default: str = "menu") -> str:
+    candidate = (origin or "").strip().lower()
+    if candidate in _MENU_ORIGINS:
+        return candidate
+    return default
+
+
+def _back_callback_for_origin(origin: str | None) -> str:
+    resolved = _normalize_menu_origin(origin, default="menu")
+    return "menu:settings" if resolved == "settings" else "menu:home"
+
+
+def _parse_simple_menu_origin(data: str, action: str, *, default: str = "menu") -> str | None:
+    prefix = f"menu:{action}"
+    if data == prefix:
+        return default
+    if not data.startswith(prefix + ":"):
+        return None
+    origin = data.removeprefix(prefix + ":")
+    if origin in _MENU_ORIGINS:
+        return origin
+    return None
+
+
+def _parse_personality_menu_payload(data: str) -> tuple[int, str] | None:
+    # Legacy: menu:personality / menu:personality:page:{n}
+    # New:    menu:personality:{origin} / menu:personality:{origin}:page:{n}
+    if data == "menu:personality":
+        return 0, "menu"
+
+    parts = data.split(":")
+    if len(parts) < 2 or parts[0] != "menu" or parts[1] != "personality":
+        return None
+
+    page = 0
+    origin = "menu"
+    if len(parts) == 4 and parts[2] == "page":
+        try:
+            page = int(parts[3])
+        except ValueError:
+            page = 0
+        return page, origin
+
+    if len(parts) == 3 and parts[2] in _MENU_ORIGINS:
+        return 0, parts[2]
+
+    if len(parts) == 5 and parts[2] in _MENU_ORIGINS and parts[3] == "page":
+        origin = parts[2]
+        try:
+            page = int(parts[4])
+        except ValueError:
+            page = 0
+        return page, origin
+
+    return None
+
+
+def _parse_custom_manage_menu_payload(data: str) -> tuple[int, str] | None:
+    # Legacy: menu:custom_instructions / menu:custom_instructions:manage / menu:custom_instructions:manage:page:{n}
+    # New:    menu:custom_instructions:manage:{origin} / menu:custom_instructions:manage:{origin}:page:{n}
+    if data == "menu:custom_instructions":
+        return 0, "settings"
+    if data == "menu:custom_instructions:manage":
+        return 0, "settings"
+
+    parts = data.split(":")
+    if len(parts) < 3 or parts[0] != "menu" or parts[1] != "custom_instructions":
+        return None
+    if parts[2] != "manage":
+        return None
+
+    if len(parts) == 5 and parts[3] == "page":
+        try:
+            return int(parts[4]), "settings"
+        except ValueError:
+            return 0, "settings"
+
+    if len(parts) == 4 and parts[3] in _MENU_ORIGINS:
+        return 0, parts[3]
+
+    if len(parts) == 6 and parts[3] in _MENU_ORIGINS and parts[4] == "page":
+        try:
+            return int(parts[5]), parts[3]
+        except ValueError:
+            return 0, parts[3]
+
+    return None
+
+
+def _parse_custom_new_origin(data: str) -> str | None:
+    if data == "menu:custom_instructions:new":
+        return "settings"
+    prefix = "menu:custom_instructions:new:"
+    if not data.startswith(prefix):
+        return None
+    origin = data.removeprefix(prefix)
+    if origin in _MENU_ORIGINS:
+        return origin
+    return None
+
+
+def _parse_custom_personality_payload(payload: str, *, default_origin: str = "settings") -> tuple[str, str]:
+    personality_id = payload.strip()
+    origin = default_origin
+    if ":" not in personality_id:
+        return personality_id, origin
+    maybe_id, maybe_origin = personality_id.rsplit(":", maxsplit=1)
+    if maybe_origin in _MENU_ORIGINS:
+        return maybe_id, maybe_origin
+    return personality_id, origin
+
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
 MAX_RESPONSE_IMAGE_PAGE_HEIGHT = 3600
@@ -164,6 +288,8 @@ RESPONSE_IMAGE_TABLE_FILL_COLOR = (28, 32, 43)
 RESPONSE_IMAGE_TABLE_HEADER_FILL_COLOR = (40, 58, 92)
 RESPONSE_IMAGE_IMAGE_FRAME_COLOR = (67, 76, 96)
 RESPONSE_IMAGE_HIGHLIGHT_FILL_COLOR = (38, 50, 76)
+CHAT_ACTION_MIN_INTERVAL_SECONDS = 2.5
+_CHAT_ACTION_NEXT_ALLOWED: dict[tuple[int, str], float] = {}
 RESPONSE_IMAGE_MAX_INLINE_IMAGE_HEIGHT = 920
 RESPONSE_IMAGE_MAX_INLINE_IMAGE_BYTES = 8 * 1024 * 1024
 RESPONSE_IMAGE_EMOJI_MAX_BYTES = 512 * 1024
@@ -185,6 +311,9 @@ RESPONSE_TABLE_BORDER_COLOR = (122, 140, 174, 255)
 RESPONSE_TABLE_HEADER_BG_COLOR = (42, 66, 113, 255)
 RESPONSE_TABLE_ROW_BG_ODD = (30, 38, 58, 220)
 RESPONSE_TABLE_ROW_BG_EVEN = (24, 31, 47, 215)
+REALTIME_DRAFT_MAX_CHARS = 4096
+REALTIME_DRAFT_MIN_APPEND_CHARS = 24
+REALTIME_DRAFT_MIN_INTERVAL_SECONDS = 0.45
 SUPERSCRIPT_CHAR_MAP: dict[str, str] = {
     "0": "⁰",
     "1": "¹",
@@ -824,7 +953,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "• Без корректного DATA_ENCRYPTION_KEY прочитать API-ключи невозможно.\n\n"
                 "2) Как работает API-поток\n"
                 "• Сообщение пользователя обрабатывается ботом и отправляется в выбранный AI-провайдер через API.\n"
-                "• При режиме Shared AI используется общий ключ сервера; при Own API используется ваш ключ.\n"
+                "• При режиме UrAI используется общий ключ сервера; при Own API используется ваш ключ.\n"
                 "• Разработчик не видит ваши plaintext API-ключи в базе: они хранятся в зашифрованном виде.\n\n"
                 "3) Что с сообщениями, медиа и логами\n"
                 "• История чата хранится в БД для работы контекста и истории диалогов.\n"
@@ -850,7 +979,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "• Without the correct DATA_ENCRYPTION_KEY, plaintext API keys cannot be recovered.\n\n"
                 "2) API data flow\n"
                 "• User input is processed by the bot and sent to the selected AI provider API.\n"
-                "• Shared AI mode uses server shared key; Own API mode uses the user key.\n"
+                "• UrAI mode uses server shared key; Own API mode uses the user key.\n"
                 "• The developer does not see plaintext API keys in DB because they are stored encrypted.\n\n"
                 "3) Messages, media, and logs\n"
                 "• Chat history is stored in DB to support context and history features.\n"
@@ -874,7 +1003,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "Privacy reference (same core facts as /privacy):\n"
                 "1) API-ключи: шифруются Fernet перед записью в БД; в SQLite хранится только encrypted_key; "
                 "расшифровка требует DATA_ENCRYPTION_KEY.\n"
-                "2) Поток данных: запрос пользователя уходит в выбранный AI API; Shared AI использует серверный ключ, "
+                "2) Поток данных: запрос пользователя уходит в выбранный AI API; UrAI использует серверный ключ, "
                 "Own API использует ключ пользователя.\n"
                 "3) Сообщения/медиа/логи: история чата хранится для контекста и history; голос/медиа обрабатываются "
                 "через API-провайдеров в рамках запроса; технические логи по умолчанию про метаданные, не про полный текст.\n"
@@ -887,7 +1016,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 "Privacy reference (same core facts as /privacy):\n"
                 "1) API keys: encrypted with Fernet before DB write; SQLite stores encrypted_key only; "
                 "decryption requires DATA_ENCRYPTION_KEY.\n"
-                "2) Data flow: user input is sent to selected AI provider API; Shared AI uses server shared key, "
+                "2) Data flow: user input is sent to selected AI provider API; UrAI uses server shared key, "
                 "Own API uses user key.\n"
                 "3) Messages/media/logs: chat history is stored for context/history features; voice/media are processed "
                 "through provider APIs during the request; technical logs default to metadata, not full message text.\n"
@@ -937,93 +1066,311 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
     async def _render_settings_hub(user_id: int) -> tuple[str, str]:
         user = await db.get_user_settings(user_id)
         lang = user.language
+        normalized_lang = normalize_language(lang)
         language_label = LANGUAGE_LABELS.get(user.language, user.language)
+        hub_texts: dict[str, dict[str, str]] = {
+            "en": {
+                "title": "⚙️ Settings Hub",
+                "intro": "Manage model, provider, language, personality, and chat controls in one place.",
+                "quick": "Quick actions:",
+                "current": "Current setup:",
+                "label_language": "Language",
+                "label_mode": "Mode",
+                "label_provider": "Provider",
+                "label_model": "Model",
+                "label_role": "Role",
+                "label_tokens": "Tokens",
+                "label_realtime": "Real-time answers",
+                "mode_personal": "Own API",
+                "mode_shared": "UrAI",
+                "rt_on": "ON",
+                "rt_off": "OFF",
+                "mode_hint_personal": "🔐 Own API mode is active: you can use your own key and any compatible model.",
+                "mode_hint_shared": "🤖 UrAI mode is active: the bot shared key is used and quota applies.",
+                "quota_hint": "🗓️ UrAI token quota resets every month.",
+                "cmd_model": "switch model",
+                "cmd_provider": "choose provider",
+                "cmd_apikey": "connect your API key",
+                "cmd_languages": "change language",
+            },
+            "ru": {
+                "title": "⚙️ Раздел настроек",
+                "intro": "Управляйте моделью, провайдером, языком, ролью и чатом в одном месте.",
+                "quick": "Быстрые действия:",
+                "current": "Текущая конфигурация:",
+                "label_language": "Язык",
+                "label_mode": "Режим",
+                "label_provider": "Провайдер",
+                "label_model": "Модель",
+                "label_role": "Роль",
+                "label_tokens": "Токены",
+                "label_realtime": "Ответы в real-time",
+                "mode_personal": "Свой API",
+                "mode_shared": "UrAI",
+                "rt_on": "ВКЛ",
+                "rt_off": "ВЫКЛ",
+                "mode_hint_personal": "🔐 Активен режим Свой API: можно использовать свой ключ и любую совместимую модель.",
+                "mode_hint_shared": "🤖 Активен режим UrAI: используется общий ключ бота и действует лимит токенов.",
+                "quota_hint": "🗓️ Лимит токенов UrAI обновляется каждый месяц.",
+                "cmd_model": "смена модели",
+                "cmd_provider": "выбор провайдера",
+                "cmd_apikey": "подключить API-ключ",
+                "cmd_languages": "смена языка",
+            },
+            "es": {
+                "title": "⚙️ Centro de ajustes",
+                "intro": "Gestiona modelo, proveedor, idioma, personalidad y chat en un solo lugar.",
+                "quick": "Acciones rapidas:",
+                "current": "Configuracion actual:",
+                "label_language": "Idioma",
+                "label_mode": "Modo",
+                "label_provider": "Proveedor",
+                "label_model": "Modelo",
+                "label_role": "Rol",
+                "label_tokens": "Tokens",
+                "label_realtime": "Respuestas en tiempo real",
+                "mode_personal": "API propia",
+                "mode_shared": "UrAI",
+                "rt_on": "ACTIVADO",
+                "rt_off": "DESACTIVADO",
+                "mode_hint_personal": "🔐 Modo API propia activo: puedes usar tu clave y cualquier modelo compatible.",
+                "mode_hint_shared": "🤖 Modo UrAI activo: se usa la clave compartida del bot y aplica cuota.",
+                "quota_hint": "🗓️ La cuota de tokens de UrAI se reinicia cada mes.",
+                "cmd_model": "cambiar modelo",
+                "cmd_provider": "elegir proveedor",
+                "cmd_apikey": "conectar clave API",
+                "cmd_languages": "cambiar idioma",
+            },
+            "fr": {
+                "title": "⚙️ Centre des parametres",
+                "intro": "Gerez modele, fournisseur, langue, personnalite et chat au meme endroit.",
+                "quick": "Actions rapides :",
+                "current": "Configuration actuelle :",
+                "label_language": "Langue",
+                "label_mode": "Mode",
+                "label_provider": "Fournisseur",
+                "label_model": "Modele",
+                "label_role": "Role",
+                "label_tokens": "Tokens",
+                "label_realtime": "Reponses en temps reel",
+                "mode_personal": "API personnelle",
+                "mode_shared": "UrAI",
+                "rt_on": "ACTIVE",
+                "rt_off": "DESACTIVEE",
+                "mode_hint_personal": "🔐 Mode API personnelle actif : utilisez votre cle et tout modele compatible.",
+                "mode_hint_shared": "🤖 Mode UrAI actif : la cle partagee du bot est utilisee avec quota.",
+                "quota_hint": "🗓️ Le quota de tokens UrAI est renouvele chaque mois.",
+                "cmd_model": "changer de modele",
+                "cmd_provider": "choisir le fournisseur",
+                "cmd_apikey": "connecter la cle API",
+                "cmd_languages": "changer la langue",
+            },
+            "tr": {
+                "title": "⚙️ Ayar merkezi",
+                "intro": "Model, saglayici, dil, kisilik ve sohbet ayarlarini tek yerde yonetin.",
+                "quick": "Hizli islemler:",
+                "current": "Mevcut ayarlar:",
+                "label_language": "Dil",
+                "label_mode": "Mod",
+                "label_provider": "Saglayici",
+                "label_model": "Model",
+                "label_role": "Rol",
+                "label_tokens": "Token",
+                "label_realtime": "Gercek zamanli yanitlar",
+                "mode_personal": "Kendi API",
+                "mode_shared": "UrAI",
+                "rt_on": "ACIK",
+                "rt_off": "KAPALI",
+                "mode_hint_personal": "🔐 Kendi API modu aktif: kendi anahtarinizi ve uyumlu modelleri kullanabilirsiniz.",
+                "mode_hint_shared": "🤖 UrAI modu aktif: botun ortak anahtari kullanilir ve kota uygulanir.",
+                "quota_hint": "🗓️ UrAI token kotasi her ay yenilenir.",
+                "cmd_model": "model degistir",
+                "cmd_provider": "saglayici sec",
+                "cmd_apikey": "API anahtari bagla",
+                "cmd_languages": "dili degistir",
+            },
+            "ar": {
+                "title": "⚙️ مركز الاعدادات",
+                "intro": "ادارة النموذج والمزود واللغة والشخصية والدردشة من مكان واحد.",
+                "quick": "اجراءات سريعة:",
+                "current": "الاعدادات الحالية:",
+                "label_language": "اللغة",
+                "label_mode": "الوضع",
+                "label_provider": "المزود",
+                "label_model": "النموذج",
+                "label_role": "الشخصية",
+                "label_tokens": "التوكنات",
+                "label_realtime": "الردود الفورية",
+                "mode_personal": "API شخصي",
+                "mode_shared": "UrAI",
+                "rt_on": "تشغيل",
+                "rt_off": "ايقاف",
+                "mode_hint_personal": "🔐 وضع API الشخصي مفعل: يمكنك استخدام مفتاحك واي نموذج متوافق.",
+                "mode_hint_shared": "🤖 وضع UrAI مفعل: يتم استخدام مفتاح البوت المشترك مع الحصة.",
+                "quota_hint": "🗓️ يتم تجديد حصة التوكنات شهريا في وضع UrAI.",
+                "cmd_model": "تغيير النموذج",
+                "cmd_provider": "اختيار المزود",
+                "cmd_apikey": "ربط مفتاح API",
+                "cmd_languages": "تغيير اللغة",
+            },
+            "de": {
+                "title": "⚙️ Einstellungszentrum",
+                "intro": "Verwalte Modell, Anbieter, Sprache, Rolle und Chat an einem Ort.",
+                "quick": "Schnellaktionen:",
+                "current": "Aktuelle Konfiguration:",
+                "label_language": "Sprache",
+                "label_mode": "Modus",
+                "label_provider": "Anbieter",
+                "label_model": "Modell",
+                "label_role": "Rolle",
+                "label_tokens": "Tokens",
+                "label_realtime": "Echtzeit-Antworten",
+                "mode_personal": "Eigene API",
+                "mode_shared": "UrAI",
+                "rt_on": "AN",
+                "rt_off": "AUS",
+                "mode_hint_personal": "🔐 Eigene-API-Modus aktiv: nutze deinen eigenen Schlussel und kompatible Modelle.",
+                "mode_hint_shared": "🤖 UrAI-Modus aktiv: der gemeinsame Bot-Schlussel wird mit Kontingent genutzt.",
+                "quota_hint": "🗓️ Das UrAI-Tokenkontingent wird monatlich erneuert.",
+                "cmd_model": "Modell wechseln",
+                "cmd_provider": "Anbieter wahlen",
+                "cmd_apikey": "API-Schlussel verbinden",
+                "cmd_languages": "Sprache andern",
+            },
+            "it": {
+                "title": "⚙️ Centro impostazioni",
+                "intro": "Gestisci modello, provider, lingua, ruolo e chat in un unico posto.",
+                "quick": "Azioni rapide:",
+                "current": "Configurazione attuale:",
+                "label_language": "Lingua",
+                "label_mode": "Modalita",
+                "label_provider": "Provider",
+                "label_model": "Modello",
+                "label_role": "Ruolo",
+                "label_tokens": "Token",
+                "label_realtime": "Risposte in tempo reale",
+                "mode_personal": "API personale",
+                "mode_shared": "UrAI",
+                "rt_on": "ATTIVO",
+                "rt_off": "DISATTIVO",
+                "mode_hint_personal": "🔐 Modalita API personale attiva: usa la tua chiave e modelli compatibili.",
+                "mode_hint_shared": "🤖 Modalita UrAI attiva: viene usata la chiave condivisa del bot con quota.",
+                "quota_hint": "🗓️ La quota token di UrAI si rinnova ogni mese.",
+                "cmd_model": "cambia modello",
+                "cmd_provider": "scegli provider",
+                "cmd_apikey": "collega chiave API",
+                "cmd_languages": "cambia lingua",
+            },
+            "pt": {
+                "title": "⚙️ Centro de configuracoes",
+                "intro": "Gerencie modelo, provedor, idioma, papel e chat em um so lugar.",
+                "quick": "Acoes rapidas:",
+                "current": "Configuracao atual:",
+                "label_language": "Idioma",
+                "label_mode": "Modo",
+                "label_provider": "Provedor",
+                "label_model": "Modelo",
+                "label_role": "Papel",
+                "label_tokens": "Tokens",
+                "label_realtime": "Respostas em tempo real",
+                "mode_personal": "API propria",
+                "mode_shared": "UrAI",
+                "rt_on": "LIGADO",
+                "rt_off": "DESLIGADO",
+                "mode_hint_personal": "🔐 Modo API propria ativo: use sua chave e qualquer modelo compativel.",
+                "mode_hint_shared": "🤖 Modo UrAI ativo: usa a chave compartilhada do bot com cota.",
+                "quota_hint": "🗓️ A cota de tokens da UrAI reinicia todo mes.",
+                "cmd_model": "trocar modelo",
+                "cmd_provider": "escolher provedor",
+                "cmd_apikey": "conectar chave API",
+                "cmd_languages": "mudar idioma",
+            },
+            "uk": {
+                "title": "⚙️ Центр налаштувань",
+                "intro": "Керуйте моделлю, провайдером, мовою, роллю та чатом в одному місці.",
+                "quick": "Швидкі дії:",
+                "current": "Поточна конфігурація:",
+                "label_language": "Мова",
+                "label_mode": "Режим",
+                "label_provider": "Провайдер",
+                "label_model": "Модель",
+                "label_role": "Роль",
+                "label_tokens": "Токени",
+                "label_realtime": "Відповіді в real-time",
+                "mode_personal": "Свій API",
+                "mode_shared": "UrAI",
+                "rt_on": "УВІМК",
+                "rt_off": "ВИМК",
+                "mode_hint_personal": "🔐 Активний режим Свій API: можна використовувати власний ключ і сумісні моделі.",
+                "mode_hint_shared": "🤖 Активний режим UrAI: використовується спільний ключ бота і діє квота.",
+                "quota_hint": "🗓️ Квота токенів UrAI оновлюється щомісяця.",
+                "cmd_model": "змінити модель",
+                "cmd_provider": "обрати провайдера",
+                "cmd_apikey": "підключити API-ключ",
+                "cmd_languages": "змінити мову",
+            },
+            "hi": {
+                "title": "⚙️ सेटिंग्स हब",
+                "intro": "मॉडल, प्रोवाइडर, भाषा, रोल और चैट सेटिंग्स एक ही जगह से मैनेज करें।",
+                "quick": "त्वरित क्रियाएं:",
+                "current": "वर्तमान कॉन्फ़िगरेशन:",
+                "label_language": "भाषा",
+                "label_mode": "मोड",
+                "label_provider": "प्रोवाइडर",
+                "label_model": "मॉडल",
+                "label_role": "रोल",
+                "label_tokens": "टोकन्स",
+                "label_realtime": "रियल-टाइम जवाब",
+                "mode_personal": "अपना API",
+                "mode_shared": "UrAI",
+                "rt_on": "चालू",
+                "rt_off": "बंद",
+                "mode_hint_personal": "🔐 अपना API मोड चालू है: आप अपनी key और compatible models इस्तेमाल कर सकते हैं।",
+                "mode_hint_shared": "🤖 UrAI मोड चालू है: बोट की shared key और quota इस्तेमाल होगा।",
+                "quota_hint": "🗓️ UrAI का token quota हर महीने रीसेट होता है।",
+                "cmd_model": "मॉडल बदलें",
+                "cmd_provider": "प्रोवाइडर चुनें",
+                "cmd_apikey": "API key जोड़ें",
+                "cmd_languages": "भाषा बदलें",
+            },
+        }
+        locale = hub_texts.get(normalized_lang, hub_texts["en"])
+        realtime_status = locale["rt_on"] if user.realtime_answers_enabled else locale["rt_off"]
 
         if user.use_personal_api:
-            mode_label = "Свой API" if normalize_language(lang) == "ru" else "Own API"
+            mode_label = locale["mode_personal"]
             provider = provider_label(user.provider)
             model = user.model or PROVIDERS[user.provider].default_model
             tokens_left = "∞"
+            mode_hint = locale["mode_hint_personal"]
         else:
-            mode_label = "Мой ИИ" if normalize_language(lang) == "ru" else "Shared AI"
+            mode_label = locale["mode_shared"]
             provider = provider_label(settings.shared_provider)
             shared_model_id = _normalize_shared_model_id(user.model)
             model = _shared_model_label(lang, shared_model_id)
             tokens_left = str(max(0, settings.shared_token_quota - user.quota_used))
+            mode_hint = locale["mode_hint_shared"]
 
         personality = await _personality_name(user_id, lang, user.personality)
-        if normalize_language(lang) == "ru":
-            mode_hint = (
-                "🔐 Сейчас активен режим Свой API: можно использовать собственный ключ и любую совместимую модель."
-                if user.use_personal_api
-                else "🤖 Сейчас активен режим Мой ИИ: работает общий ключ бота и действует лимит токенов."
-            )
-            tokens_refresh_hint = (
-                "🗓️ В режиме Мой ИИ лимит токенов обновляется каждый месяц."
-                if user.use_personal_api
-                else "🗓️ Лимит токенов Мой ИИ обновляется каждый месяц."
-            )
-            text = (
-                "⚙️ Раздел настроек\n\n"
-                "Здесь собраны все ключевые параметры бота в одном месте.\n"
-                "Вы можете быстро переключить режим работы и сразу продолжить диалог без лишних шагов.\n\n"
-                "Что можно сделать:\n"
-                "1. Выбрать модель и режим API (Мой ИИ / Свой API).\n"
-                "2. Выбрать роль ассистента и стиль ответов.\n"
-                "3. Настроить провайдера, API-ключ и base URL.\n"
-                "4. Изменить язык интерфейса.\n"
-                "5. Открыть историю или начать новый чистый чат.\n\n"
-                "Быстрые действия:\n"
-                "• /model — смена модели\n"
-                "• /provider — выбор провайдера\n"
-                "• /apikey — подключить свой API-ключ\n"
-                "• /languages — смена языка\n\n"
-                "Текущая конфигурация:\n"
-                f"• 🌐 Язык: {language_label}\n"
-                f"• 🛂 Режим: {mode_label}\n"
-                f"• 🤖 Провайдер: {provider}\n"
-                f"• 🧠 Модель: {model}\n"
-                f"• 🎭 Роль: {personality}\n"
-                f"• 🪙 Токены: {tokens_left}\n\n"
-                f"{mode_hint}\n"
-                f"{tokens_refresh_hint}"
-            )
-        else:
-            mode_hint = (
-                "🔐 Own API mode is active: you can use your own key and any compatible model."
-                if user.use_personal_api
-                else "🤖 Shared AI mode is active: the bot's shared key is used and token quota applies."
-            )
-            tokens_refresh_hint = (
-                "🗓️ Shared AI token quota resets every month."
-                if user.use_personal_api
-                else "🗓️ Shared AI token quota resets every month."
-            )
-            text = (
-                "⚙️ Settings Hub\n\n"
-                "All key bot controls are gathered here in one place.\n"
-                "You can switch setup quickly and continue chatting right away.\n\n"
-                "What you can do:\n"
-                "1. Pick model and API mode (Shared AI / Own API).\n"
-                "2. Choose assistant role and response style.\n"
-                "3. Configure provider, API key, and base URL.\n"
-                "4. Change interface language.\n"
-                "5. Open history or start a clean chat.\n\n"
-                "Quick actions:\n"
-                "• /model — switch model\n"
-                "• /provider — choose provider\n"
-                "• /apikey — connect your own API key\n"
-                "• /languages — change language\n\n"
-                "Current setup:\n"
-                f"• 🌐 Language: {language_label}\n"
-                f"• 🛂 Mode: {mode_label}\n"
-                f"• 🤖 Provider: {provider}\n"
-                f"• 🧠 Model: {model}\n"
-                f"• 🎭 Role: {personality}\n"
-                f"• 🪙 Tokens: {tokens_left}\n\n"
-                f"{mode_hint}\n"
-                f"{tokens_refresh_hint}"
-            )
+        text = (
+            f"{locale['title']}\n\n"
+            f"{locale['intro']}\n\n"
+            f"{locale['quick']}\n"
+            f"• /model — {locale['cmd_model']}\n"
+            f"• /provider — {locale['cmd_provider']}\n"
+            f"• /apikey — {locale['cmd_apikey']}\n"
+            f"• /languages — {locale['cmd_languages']}\n\n"
+            f"{locale['current']}\n"
+            f"• 🌐 {locale['label_language']}: {language_label}\n"
+            f"• 🛂 {locale['label_mode']}: {mode_label}\n"
+            f"• 🤖 {locale['label_provider']}: {provider}\n"
+            f"• 🧠 {locale['label_model']}: {model}\n"
+            f"• 🎭 {locale['label_role']}: {personality}\n"
+            f"• 🪙 {locale['label_tokens']}: {tokens_left}\n"
+            f"• ⚡ {locale['label_realtime']}: {realtime_status}\n\n"
+            f"{mode_hint}\n"
+            f"{locale['quota_hint']}"
+        )
         return escape_markdown_v2(text), lang
 
     async def _user_lang(user_id: int) -> str:
@@ -1059,17 +1406,24 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         custom_items = await db.list_custom_personalities(user_id)
         return [(item.personality_id, item.title) for item in custom_items]
 
-    async def _custom_instructions_manage_view(user_id: int, *, page: int = 0) -> tuple[str, str, InlineKeyboardMarkup]:
+    async def _custom_instructions_manage_view(
+        user_id: int,
+        *,
+        page: int = 0,
+        source: str = "settings",
+    ) -> tuple[str, str, InlineKeyboardMarkup]:
         user = await db.get_user_settings(user_id)
         lang = user.language
+        safe_source = _normalize_menu_origin(source, default="settings")
         custom_items = await _custom_personality_items(user_id)
         text = _md(lang, "custom_instructions_manage_title" if custom_items else "custom_instructions_manage_empty")
         keyboard = custom_instructions_manage_keyboard(
             language=lang,
             custom_personalities=custom_items,
+            origin=safe_source,
             page=page,
             with_back=True,
-            back_callback="menu:settings",
+            back_callback=_back_callback_for_origin(safe_source),
         )
         return text, lang, keyboard
 
@@ -1110,8 +1464,10 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         )
         presentation_guardrail = (
             "Presentation style (applies to all personalities): use Markdown formatting frequently to improve readability "
-            "(short headings, bullet lists, bold highlights, blockquotes, and inline code when helpful). "
+            "(short headings, bullet lists, bold highlights, Telegram quote blocks using '>' at line start, and inline code when helpful). "
+            "Do not use HTML tags for formatting (no <u>, <blockquote>, <b>, etc.); use MarkdownV2 syntax only. "
             "Use visible emphasis in most non-trivial replies: highlight key terms with **bold**, and structure steps with short section headers. "
+            "Use __underline__ selectively for definitions, labels, warnings, or deadlines that should pop out; avoid overusing underline in every sentence. "
             "For comparisons, options, pricing, metrics, trade-offs, or 3+ structured items, prefer a Markdown pipe table with a valid separator row. "
             "Do not draw ASCII-art tables; use proper Markdown tables only. "
             "When a response has 3+ sentences, prefer at least one bold highlight and one compact list or one compact table. "
@@ -1132,8 +1488,8 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             "explicitly asks about them."
         )
         models_guardrail = (
-            "Shared AI models policy (applies to all personalities): if the user asks what models are available in the "
-            "bot, state clearly that Shared AI has exactly 4 models: GPT 4, LLaMA 4 (Media support), LLaMA 3, and Groq Compound. "
+            "UrAI models policy (applies to all personalities): if the user asks what models are available in the "
+            "bot, state clearly that UrAI has exactly 4 models: GPT 4, LLaMA 4 (Media support), LLaMA 3, and Groq Compound. "
             "Mention model details only when the user asks about models/features."
         )
         clean_mention = (user_mention or "").strip() or "the user"
@@ -1600,7 +1956,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             )
             query = rewritten_query
 
-        await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+        await _send_chat_action_safe(message, ChatAction.TYPING)
         try:
             results = await _run_ranked_web_search(
                 query,
@@ -1834,7 +2190,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                     parse_mode="MarkdownV2",
                 )
                 return
-            # Handle Shared AI provider specially
+            # Handle UrAI provider specially
             if raw == "shared_ai":
                 await db.set_use_personal_api(message.from_user.id, False)
                 await db.set_provider(message.from_user.id, settings.shared_provider)
@@ -1865,7 +2221,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             await query.answer(t(lang, "unknown_provider"), show_alert=True)
             return
 
-        # Handle Shared AI provider specially
+        # Handle UrAI provider specially
         if provider_id == "shared_ai":
             await db.set_use_personal_api(query.from_user.id, False)
             await db.set_provider(query.from_user.id, settings.shared_provider)
@@ -1909,6 +2265,8 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                         custom_personalities=custom_items,
                         active_personality=user.personality,
                         with_back=True,
+                        callback_prefix="menu:personality:menu",
+                        custom_instructions_callback="menu:custom_instructions:manage:menu",
                     ),
                     parse_mode="MarkdownV2",
                 )
@@ -1929,6 +2287,8 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 custom_personalities=custom_items,
                 active_personality=user.personality,
                 with_back=True,
+                callback_prefix="menu:personality:menu",
+                custom_instructions_callback="menu:custom_instructions:manage:menu",
             ),
             parse_mode="MarkdownV2",
         )
@@ -1994,11 +2354,15 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         if await _deny_if_not_private(message, lang):
             return
 
+        data = await state.get_data()
+        origin = _normalize_menu_origin(data.get("custom_origin"), default="settings")
+        manage_callback = f"menu:custom_instructions:manage:{origin}"
+
         custom_title = message.text.strip()
         if not custom_title:
             await message.answer(
                 _md(lang, "ask_custom_instruction_name"),
-                reply_markup=cancel_input_keyboard(language=lang),
+                reply_markup=cancel_input_keyboard(language=lang, callback_data=manage_callback),
                 parse_mode="MarkdownV2",
             )
             return
@@ -2007,7 +2371,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         await state.set_state(SetupStates.waiting_custom_instructions)
         await message.answer(
             _md(lang, "ask_custom_instructions"),
-            reply_markup=cancel_input_keyboard(language=lang),
+            reply_markup=cancel_input_keyboard(language=lang, callback_data=manage_callback),
             parse_mode="MarkdownV2",
         )
 
@@ -2020,25 +2384,33 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         if await _deny_if_not_private(message, lang):
             return
 
+        data = await state.get_data()
+        origin = _normalize_menu_origin(data.get("custom_origin"), default="settings")
+        manage_callback = f"menu:custom_instructions:manage:{origin}"
+        fallback_markup = (
+            settings_keyboard(lang, realtime_answers_enabled=user.realtime_answers_enabled)
+            if origin == "settings"
+            else main_menu_keyboard(lang)
+        )
+
         instructions = message.text.strip()
         if not instructions:
             await message.answer(
                 _md(lang, "ask_custom_instructions"),
                 reply_markup=cancel_input_keyboard(
                     language=lang,
-                    callback_data="menu:custom_instructions:manage",
+                    callback_data=manage_callback,
                 ),
                 parse_mode="MarkdownV2",
             )
             return
 
-        data = await state.get_data()
         personality_id = str(data.get("custom_edit_personality_id") or "").strip()
         if not personality_id:
             await state.clear()
             await message.answer(
                 _md(lang, "custom_instructions_not_found"),
-                reply_markup=settings_keyboard(lang),
+                reply_markup=fallback_markup,
                 parse_mode="MarkdownV2",
             )
             return
@@ -2056,7 +2428,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         if not custom:
             await message.answer(
                 _md(lang, "custom_instructions_not_found"),
-                reply_markup=settings_keyboard(lang),
+                reply_markup=fallback_markup,
                 parse_mode="MarkdownV2",
             )
             return
@@ -2065,7 +2437,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             _md(lang, "custom_instructions_updated", personality=f"🧾 {custom.title}"),
             parse_mode="MarkdownV2",
         )
-        view_text, _, view_markup = await _custom_instructions_manage_view(message.from_user.id)
+        view_text, _, view_markup = await _custom_instructions_manage_view(message.from_user.id, source=origin)
         await message.answer(
             view_text,
             reply_markup=view_markup,
@@ -2081,27 +2453,34 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         if await _deny_if_not_private(message, lang):
             return
 
+        data = await state.get_data()
+        origin = _normalize_menu_origin(data.get("custom_origin"), default="settings")
+        manage_callback = f"menu:custom_instructions:manage:{origin}"
+        fallback_markup = (
+            settings_keyboard(lang, realtime_answers_enabled=user.realtime_answers_enabled)
+            if origin == "settings"
+            else main_menu_keyboard(lang)
+        )
+
         custom_title = message.text.strip()
         if not custom_title:
-            data = await state.get_data()
             current_title = str(data.get("custom_edit_personality_title") or "").strip() or "Custom personality"
             await message.answer(
                 _md(lang, "custom_instructions_rename_prompt", personality=f"🧾 {current_title}"),
                 reply_markup=cancel_input_keyboard(
                     language=lang,
-                    callback_data="menu:custom_instructions:manage",
+                    callback_data=manage_callback,
                 ),
                 parse_mode="MarkdownV2",
             )
             return
 
-        data = await state.get_data()
         personality_id = str(data.get("custom_edit_personality_id") or "").strip()
         if not personality_id:
             await state.clear()
             await message.answer(
                 _md(lang, "custom_instructions_not_found"),
-                reply_markup=settings_keyboard(lang),
+                reply_markup=fallback_markup,
                 parse_mode="MarkdownV2",
             )
             return
@@ -2119,7 +2498,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         if not custom:
             await message.answer(
                 _md(lang, "custom_instructions_not_found"),
-                reply_markup=settings_keyboard(lang),
+                reply_markup=fallback_markup,
                 parse_mode="MarkdownV2",
             )
             return
@@ -2128,7 +2507,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             _md(lang, "custom_instructions_renamed", personality=f"🧾 {custom.title}"),
             parse_mode="MarkdownV2",
         )
-        view_text, _, view_markup = await _custom_instructions_manage_view(message.from_user.id)
+        view_text, _, view_markup = await _custom_instructions_manage_view(message.from_user.id, source=origin)
         await message.answer(
             view_text,
             reply_markup=view_markup,
@@ -2246,7 +2625,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                     await state.set_state(SetupStates.waiting_model)
                     await message.answer(
                         _md(lang, "ask_model"),
-                        reply_markup=use_bot_ai_keyboard(language=lang),
+                        reply_markup=use_bot_ai_keyboard(language=lang, callback_data="model:use_bot_ai:menu"),
                         parse_mode="MarkdownV2",
                     )
                     return
@@ -2268,6 +2647,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                     language=lang,
                     active_model=_normalize_shared_model_id(user.model),
                     personal_api_enabled=user.use_personal_api,
+                    origin="menu",
                 ),
                 parse_mode="MarkdownV2",
             )
@@ -2285,7 +2665,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         await state.set_state(SetupStates.waiting_model)
         await message.answer(
             _md(lang, "ask_model"),
-            reply_markup=use_bot_ai_keyboard(language=lang),
+            reply_markup=use_bot_ai_keyboard(language=lang, callback_data="model:use_bot_ai:menu"),
             parse_mode="MarkdownV2",
         )
 
@@ -2306,6 +2686,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                     language=lang,
                     active_model=_normalize_shared_model_id(user.model),
                     personal_api_enabled=user.use_personal_api,
+                    origin="menu",
                 ),
                 parse_mode="MarkdownV2",
             )
@@ -2348,6 +2729,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         await state.set_state(SetupStates.waiting_base_url)
         await message.answer(
             _md(lang, "ask_base_url"),
+            reply_markup=cancel_input_keyboard(language=lang),
             parse_mode="MarkdownV2",
         )
 
@@ -2387,7 +2769,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         text, lang = await _render_settings_hub(message.from_user.id)
         await message.answer(
             text,
-            reply_markup=settings_keyboard(lang),
+            reply_markup=settings_keyboard(lang, realtime_answers_enabled=user.realtime_answers_enabled),
             parse_mode="MarkdownV2",
         )
 
@@ -2499,27 +2881,62 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
     async def on_menu_history(query: CallbackQuery) -> None:
         if query.from_user is None:
             return
-        raw_page = query.data.rsplit(":", maxsplit=1)[-1]
+        user_settings = await db.get_user_settings(query.from_user.id)
+        payload = (query.data or "").split(":")
+        from_settings = len(payload) >= 4 and payload[2] == "settings"
+        raw_page = payload[3] if from_settings else payload[-1]
         try:
             page = int(raw_page)
         except ValueError:
             page = 0
         text, lang, safe_page, total = await _history_view(query.from_user.id, page)
+        keyboard_kwargs: dict[str, str] = {}
+        if from_settings:
+            keyboard_kwargs = {
+                "callback_prefix": "menu:history:settings",
+                "openchat_prefix": "menu:openchat:settings",
+                "deletechat_prefix": "menu:deletechat:settings",
+                "back_callback": "menu:settings",
+            }
         await query.answer()
         if total == 0:
+            if from_settings and query.message:
+                try:
+                    await query.message.edit_text(
+                        text,
+                        reply_markup=settings_keyboard(lang, realtime_answers_enabled=user_settings.realtime_answers_enabled),
+                        parse_mode="MarkdownV2",
+                    )
+                except TelegramBadRequest:
+                    await query.message.answer(
+                        text,
+                        reply_markup=settings_keyboard(lang, realtime_answers_enabled=user_settings.realtime_answers_enabled),
+                        parse_mode="MarkdownV2",
+                    )
+                return
             await _safe_edit(query, text, lang=lang)
             return
         if query.message:
             try:
                 await query.message.edit_text(
                     text,
-                    reply_markup=history_keyboard(language=lang, page=safe_page, total=total),
+                    reply_markup=history_keyboard(
+                        language=lang,
+                        page=safe_page,
+                        total=total,
+                        **keyboard_kwargs,
+                    ),
                     parse_mode="MarkdownV2",
                 )
             except TelegramBadRequest:
                 await query.message.answer(
                     text,
-                    reply_markup=history_keyboard(language=lang, page=safe_page, total=total),
+                    reply_markup=history_keyboard(
+                        language=lang,
+                        page=safe_page,
+                        total=total,
+                        **keyboard_kwargs,
+                    ),
                     parse_mode="MarkdownV2",
                 )
 
@@ -2527,13 +2944,24 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
     async def on_menu_delete_chat(query: CallbackQuery) -> None:
         if query.from_user is None:
             return
-        raw_page = query.data.rsplit(":", maxsplit=1)[-1]
+        user_settings = await db.get_user_settings(query.from_user.id)
+        payload = (query.data or "").split(":")
+        from_settings = len(payload) >= 4 and payload[2] == "settings"
+        raw_page = payload[3] if from_settings else payload[-1]
         try:
             page = int(raw_page)
         except ValueError:
             page = 0
 
         chat_id, lang, safe_page, total, _ = await _history_chat_meta(query.from_user.id, page)
+        keyboard_kwargs: dict[str, str] = {}
+        if from_settings:
+            keyboard_kwargs = {
+                "callback_prefix": "menu:history:settings",
+                "openchat_prefix": "menu:openchat:settings",
+                "deletechat_prefix": "menu:deletechat:settings",
+                "back_callback": "menu:settings",
+            }
         if chat_id is None or total == 0:
             await query.answer(t(lang, "no_history"), show_alert=True)
             return
@@ -2543,19 +2971,43 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
 
         text, lang, new_page, new_total = await _history_view(query.from_user.id, safe_page)
         if new_total == 0:
+            if from_settings and query.message:
+                try:
+                    await query.message.edit_text(
+                        text,
+                        reply_markup=settings_keyboard(lang, realtime_answers_enabled=user_settings.realtime_answers_enabled),
+                        parse_mode="MarkdownV2",
+                    )
+                except TelegramBadRequest:
+                    await query.message.answer(
+                        text,
+                        reply_markup=settings_keyboard(lang, realtime_answers_enabled=user_settings.realtime_answers_enabled),
+                        parse_mode="MarkdownV2",
+                    )
+                return
             await _safe_edit(query, text, lang=lang)
             return
         if query.message:
             try:
                 await query.message.edit_text(
                     text,
-                    reply_markup=history_keyboard(language=lang, page=new_page, total=new_total),
+                    reply_markup=history_keyboard(
+                        language=lang,
+                        page=new_page,
+                        total=new_total,
+                        **keyboard_kwargs,
+                    ),
                     parse_mode="MarkdownV2",
                 )
             except TelegramBadRequest:
                 await query.message.answer(
                     text,
-                    reply_markup=history_keyboard(language=lang, page=new_page, total=new_total),
+                    reply_markup=history_keyboard(
+                        language=lang,
+                        page=new_page,
+                        total=new_total,
+                        **keyboard_kwargs,
+                    ),
                     parse_mode="MarkdownV2",
                 )
 
@@ -2563,13 +3015,24 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
     async def on_menu_open_chat(query: CallbackQuery) -> None:
         if query.from_user is None:
             return
-        raw_page = query.data.rsplit(":", maxsplit=1)[-1]
+        user_settings = await db.get_user_settings(query.from_user.id)
+        payload = (query.data or "").split(":")
+        from_settings = len(payload) >= 4 and payload[2] == "settings"
+        raw_page = payload[3] if from_settings else payload[-1]
         try:
             page = int(raw_page)
         except ValueError:
             page = 0
 
         chat_id, lang, safe_page, total, title = await _history_chat_meta(query.from_user.id, page)
+        keyboard_kwargs: dict[str, str] = {}
+        if from_settings:
+            keyboard_kwargs = {
+                "callback_prefix": "menu:history:settings",
+                "openchat_prefix": "menu:openchat:settings",
+                "deletechat_prefix": "menu:deletechat:settings",
+                "back_callback": "menu:settings",
+            }
         if chat_id is None or total == 0:
             await query.answer(t(lang, "no_history"), show_alert=True)
             return
@@ -2579,19 +3042,43 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
 
         text, lang, new_page, new_total = await _history_view(query.from_user.id, safe_page)
         if new_total == 0:
+            if from_settings and query.message:
+                try:
+                    await query.message.edit_text(
+                        text,
+                        reply_markup=settings_keyboard(lang, realtime_answers_enabled=user_settings.realtime_answers_enabled),
+                        parse_mode="MarkdownV2",
+                    )
+                except TelegramBadRequest:
+                    await query.message.answer(
+                        text,
+                        reply_markup=settings_keyboard(lang, realtime_answers_enabled=user_settings.realtime_answers_enabled),
+                        parse_mode="MarkdownV2",
+                    )
+                return
             await _safe_edit(query, text, lang=lang)
             return
         if query.message:
             try:
                 await query.message.edit_text(
                     text,
-                    reply_markup=history_keyboard(language=lang, page=new_page, total=new_total),
+                    reply_markup=history_keyboard(
+                        language=lang,
+                        page=new_page,
+                        total=new_total,
+                        **keyboard_kwargs,
+                    ),
                     parse_mode="MarkdownV2",
                 )
             except TelegramBadRequest:
                 await query.message.answer(
                     text,
-                    reply_markup=history_keyboard(language=lang, page=new_page, total=new_total),
+                    reply_markup=history_keyboard(
+                        language=lang,
+                        page=new_page,
+                        total=new_total,
+                        **keyboard_kwargs,
+                    ),
                     parse_mode="MarkdownV2",
                 )
 
@@ -2601,7 +3088,9 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             return
         user = await db.get_user_settings(query.from_user.id)
         lang = user.language
-        model_id = query.data.split(":", maxsplit=1)[1].strip().lower()
+        payload = (query.data or "").split(":")
+        model_id = payload[1].strip().lower() if len(payload) > 1 else ""
+        origin = _normalize_menu_origin(payload[2] if len(payload) > 2 else None, default="menu")
 
         if model_id == "own_api":
             await db.set_use_personal_api(query.from_user.id, True)
@@ -2611,13 +3100,13 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 try:
                     await query.message.edit_text(
                         _md(lang, "ask_model"),
-                        reply_markup=use_bot_ai_keyboard(language=lang),
+                        reply_markup=use_bot_ai_keyboard(language=lang, callback_data=f"model:use_bot_ai:{origin}"),
                         parse_mode="MarkdownV2",
                     )
                 except TelegramBadRequest:
                     await query.message.answer(
                         _md(lang, "ask_model"),
-                        reply_markup=use_bot_ai_keyboard(language=lang),
+                        reply_markup=use_bot_ai_keyboard(language=lang, callback_data=f"model:use_bot_ai:{origin}"),
                         parse_mode="MarkdownV2",
                     )
             return
@@ -2637,10 +3126,12 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             lang=lang,
         )
 
-    @router.callback_query(F.data == "model:use_bot_ai")
+    @router.callback_query(F.data.startswith("model:use_bot_ai"))
     async def on_use_bot_ai_callback(query: CallbackQuery, state: FSMContext) -> None:
         if query.from_user is None:
             return
+        payload = (query.data or "").split(":")
+        origin = _normalize_menu_origin(payload[2] if len(payload) > 2 else None, default="menu")
         user = await db.get_user_settings(query.from_user.id)
         lang = user.language
         await db.set_use_personal_api(query.from_user.id, False)
@@ -2654,6 +3145,8 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                         language=lang,
                         active_model=_normalize_shared_model_id(user.model),
                         personal_api_enabled=False,
+                        origin=origin,
+                        back_callback=_back_callback_for_origin(origin),
                     ),
                     parse_mode="MarkdownV2",
                 )
@@ -2664,6 +3157,8 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                         language=lang,
                         active_model=_normalize_shared_model_id(user.model),
                         personal_api_enabled=False,
+                        origin=origin,
+                        back_callback=_back_callback_for_origin(origin),
                     ),
                     parse_mode="MarkdownV2",
                 )
@@ -2674,7 +3169,8 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             return
         user = await db.get_user_settings(query.from_user.id)
         lang = user.language
-        personality_id = query.data.split(":", maxsplit=1)[1].strip()
+        payload = query.data.split(":", maxsplit=1)[1].strip()
+        personality_id, origin = _parse_custom_personality_payload(payload, default_origin="settings")
         custom = await db.get_custom_personality(query.from_user.id, personality_id)
         if not custom:
             await query.answer(t(lang, "custom_instructions_not_found"), show_alert=True)
@@ -2687,13 +3183,21 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             try:
                 await query.message.edit_text(
                     preview_text,
-                    reply_markup=custom_instructions_edit_keyboard(language=lang, personality_id=personality_id),
+                    reply_markup=custom_instructions_edit_keyboard(
+                        language=lang,
+                        personality_id=personality_id,
+                        origin=origin,
+                    ),
                     parse_mode="MarkdownV2",
                 )
             except TelegramBadRequest:
                 await query.message.answer(
                     preview_text,
-                    reply_markup=custom_instructions_edit_keyboard(language=lang, personality_id=personality_id),
+                    reply_markup=custom_instructions_edit_keyboard(
+                        language=lang,
+                        personality_id=personality_id,
+                        origin=origin,
+                    ),
                     parse_mode="MarkdownV2",
                 )
 
@@ -2703,14 +3207,18 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             return
         user = await db.get_user_settings(query.from_user.id)
         lang = user.language
-        personality_id = query.data.split(":", maxsplit=1)[1].strip()
+        payload = query.data.split(":", maxsplit=1)[1].strip()
+        personality_id, origin = _parse_custom_personality_payload(payload, default_origin="settings")
         custom = await db.get_custom_personality(query.from_user.id, personality_id)
         if not custom:
             await query.answer(t(lang, "custom_instructions_not_found"), show_alert=True)
             return
 
         await state.clear()
-        await state.update_data(custom_edit_personality_id=personality_id)
+        await state.update_data(
+            custom_edit_personality_id=personality_id,
+            custom_origin=origin,
+        )
         await state.set_state(SetupStates.waiting_custom_instructions_update)
         await query.answer()
         if query.message:
@@ -2718,7 +3226,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 _md(lang, "custom_instructions_edit_prompt", personality=f"🧾 {custom.title}"),
                 reply_markup=cancel_input_keyboard(
                     language=lang,
-                    callback_data="menu:custom_instructions:manage",
+                    callback_data=f"menu:custom_instructions:manage:{origin}",
                 ),
                 parse_mode="MarkdownV2",
             )
@@ -2729,7 +3237,8 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             return
         user = await db.get_user_settings(query.from_user.id)
         lang = user.language
-        personality_id = query.data.split(":", maxsplit=1)[1].strip()
+        payload = query.data.split(":", maxsplit=1)[1].strip()
+        personality_id, origin = _parse_custom_personality_payload(payload, default_origin="settings")
         custom = await db.get_custom_personality(query.from_user.id, personality_id)
         if not custom:
             await query.answer(t(lang, "custom_instructions_not_found"), show_alert=True)
@@ -2739,6 +3248,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         await state.update_data(
             custom_edit_personality_id=personality_id,
             custom_edit_personality_title=custom.title,
+            custom_origin=origin,
         )
         await state.set_state(SetupStates.waiting_custom_instruction_name_update)
         await query.answer()
@@ -2747,7 +3257,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 _md(lang, "custom_instructions_rename_prompt", personality=f"🧾 {custom.title}"),
                 reply_markup=cancel_input_keyboard(
                     language=lang,
-                    callback_data="menu:custom_instructions:manage",
+                    callback_data=f"menu:custom_instructions:manage:{origin}",
                 ),
                 parse_mode="MarkdownV2",
             )
@@ -2758,7 +3268,8 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             return
         user = await db.get_user_settings(query.from_user.id)
         lang = user.language
-        personality_id = query.data.split(":", maxsplit=1)[1].strip()
+        payload = query.data.split(":", maxsplit=1)[1].strip()
+        personality_id, origin = _parse_custom_personality_payload(payload, default_origin="settings")
         custom = await db.get_custom_personality(query.from_user.id, personality_id)
         if not custom:
             await query.answer(t(lang, "custom_instructions_not_found"), show_alert=True)
@@ -2770,13 +3281,21 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             try:
                 await query.message.edit_text(
                     _md(lang, "custom_instructions_delete_confirm", personality=f"🧾 {custom.title}"),
-                    reply_markup=custom_instructions_delete_confirm_keyboard(language=lang, personality_id=personality_id),
+                    reply_markup=custom_instructions_delete_confirm_keyboard(
+                        language=lang,
+                        personality_id=personality_id,
+                        origin=origin,
+                    ),
                     parse_mode="MarkdownV2",
                 )
             except TelegramBadRequest:
                 await query.message.answer(
                     _md(lang, "custom_instructions_delete_confirm", personality=f"🧾 {custom.title}"),
-                    reply_markup=custom_instructions_delete_confirm_keyboard(language=lang, personality_id=personality_id),
+                    reply_markup=custom_instructions_delete_confirm_keyboard(
+                        language=lang,
+                        personality_id=personality_id,
+                        origin=origin,
+                    ),
                     parse_mode="MarkdownV2",
                 )
 
@@ -2787,7 +3306,8 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         user_id = query.from_user.id
         user = await db.get_user_settings(user_id)
         lang = user.language
-        personality_id = query.data.split(":", maxsplit=1)[1].strip()
+        payload = query.data.split(":", maxsplit=1)[1].strip()
+        personality_id, origin = _parse_custom_personality_payload(payload, default_origin="settings")
         custom = await db.get_custom_personality(user_id, personality_id)
         deleted = await db.delete_custom_personality(user_id, personality_id)
         await state.clear()
@@ -2797,7 +3317,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
 
         deleted_title = custom.title if custom else personality_id
         await query.answer(t(lang, "custom_instructions_deleted", personality=f"🧾 {deleted_title}"))
-        text, _, markup = await _custom_instructions_manage_view(user_id)
+        text, _, markup = await _custom_instructions_manage_view(user_id, source=origin)
         text = _md(lang, "custom_instructions_deleted", personality=f"🧾 {deleted_title}") + "\n\n" + text
         if query.message:
             try:
@@ -2819,12 +3339,13 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             return
         user = await db.get_user_settings(query.from_user.id)
         lang = user.language
-        personality_id = query.data.split(":", maxsplit=1)[1].strip()
+        payload = query.data.split(":", maxsplit=1)[1].strip()
+        personality_id, origin = _parse_custom_personality_payload(payload, default_origin="settings")
         custom = await db.get_custom_personality(query.from_user.id, personality_id)
         await state.clear()
         await query.answer()
         if not custom:
-            text, _, markup = await _custom_instructions_manage_view(query.from_user.id)
+            text, _, markup = await _custom_instructions_manage_view(query.from_user.id, source=origin)
             if query.message:
                 try:
                     await query.message.edit_text(
@@ -2845,13 +3366,21 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             try:
                 await query.message.edit_text(
                     preview_text,
-                    reply_markup=custom_instructions_edit_keyboard(language=lang, personality_id=personality_id),
+                    reply_markup=custom_instructions_edit_keyboard(
+                        language=lang,
+                        personality_id=personality_id,
+                        origin=origin,
+                    ),
                     parse_mode="MarkdownV2",
                 )
             except TelegramBadRequest:
                 await query.message.answer(
                     preview_text,
-                    reply_markup=custom_instructions_edit_keyboard(language=lang, personality_id=personality_id),
+                    reply_markup=custom_instructions_edit_keyboard(
+                        language=lang,
+                        personality_id=personality_id,
+                        origin=origin,
+                    ),
                     parse_mode="MarkdownV2",
                 )
 
@@ -2860,7 +3389,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         if query.from_user is None:
             return
         await state.clear()
-        text, lang, markup = await _custom_instructions_manage_view(query.from_user.id)
+        text, lang, markup = await _custom_instructions_manage_view(query.from_user.id, source="settings")
         await query.answer()
         if query.message:
             try:
@@ -2885,6 +3414,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         data = query.data or ""
 
         if data == "menu:home":
+            await state.clear()
             await query.answer()
             await _safe_edit(query, _md(lang, "menu_title"), lang=lang)
             return
@@ -2896,83 +3426,129 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             return
 
         if data == "menu:settings":
+            await state.clear()
             text, lang = await _render_settings_hub(query.from_user.id)
             await query.answer()
             if query.message:
                 try:
                     await query.message.edit_text(
                         text,
-                        reply_markup=settings_keyboard(lang),
+                        reply_markup=settings_keyboard(lang, realtime_answers_enabled=user.realtime_answers_enabled),
                         parse_mode="MarkdownV2",
                     )
                 except TelegramBadRequest:
                     await query.message.answer(
                         text,
-                        reply_markup=settings_keyboard(lang),
+                        reply_markup=settings_keyboard(lang, realtime_answers_enabled=user.realtime_answers_enabled),
                         parse_mode="MarkdownV2",
                     )
             return
 
-        if data == "menu:limit":
+        if data == "menu:realtime_answers:toggle":
+            new_state = not user.realtime_answers_enabled
+            await db.set_realtime_answers_enabled(query.from_user.id, new_state)
+            user = await db.get_user_settings(query.from_user.id)
+            lang = user.language
+            status = t(lang, "realtime_answers_on" if user.realtime_answers_enabled else "realtime_answers_off")
+            await query.answer(t(lang, "realtime_answers_toggled", status=status))
+            text, lang = await _render_settings_hub(query.from_user.id)
+            if query.message:
+                try:
+                    await query.message.edit_text(
+                        text,
+                        reply_markup=settings_keyboard(lang, realtime_answers_enabled=user.realtime_answers_enabled),
+                        parse_mode="MarkdownV2",
+                    )
+                except TelegramBadRequest:
+                    await query.message.answer(
+                        text,
+                        reply_markup=settings_keyboard(lang, realtime_answers_enabled=user.realtime_answers_enabled),
+                        parse_mode="MarkdownV2",
+                    )
+            return
+
+        limit_origin = _parse_simple_menu_origin(data, "limit", default="settings")
+        if limit_origin is not None:
             text = _render_limit_text(user=user, lang=lang)
             await query.answer()
+            target_markup = (
+                settings_keyboard(lang, realtime_answers_enabled=user.realtime_answers_enabled)
+                if limit_origin == "settings"
+                else main_menu_keyboard(lang)
+            )
             if query.message:
                 try:
                     await query.message.edit_text(
                         text,
-                        reply_markup=settings_keyboard(lang),
+                        reply_markup=target_markup,
                         parse_mode="MarkdownV2",
                     )
                 except TelegramBadRequest:
                     await query.message.answer(
                         text,
-                        reply_markup=settings_keyboard(lang),
+                        reply_markup=target_markup,
                         parse_mode="MarkdownV2",
                     )
             return
 
-        if data == "menu:provider":
+        provider_origin = _parse_simple_menu_origin(data, "provider", default="settings")
+        if provider_origin is not None:
+            back_callback = _back_callback_for_origin(provider_origin)
             await query.answer()
             if query.message:
                 try:
                     await query.message.edit_text(
                         _md(lang, "choose_provider"),
-                        reply_markup=provider_keyboard(language=lang, with_back=True),
+                        reply_markup=provider_keyboard(
+                            language=lang,
+                            with_back=True,
+                            back_callback=back_callback,
+                        ),
                         parse_mode="MarkdownV2",
                     )
                 except TelegramBadRequest:
                     await query.message.answer(
                         _md(lang, "choose_provider"),
-                        reply_markup=provider_keyboard(language=lang, with_back=True),
+                        reply_markup=provider_keyboard(
+                            language=lang,
+                            with_back=True,
+                            back_callback=back_callback,
+                        ),
                         parse_mode="MarkdownV2",
                     )
             return
 
-        if data == "menu:language":
+        language_origin = _parse_simple_menu_origin(data, "language", default="settings")
+        if language_origin is not None:
+            back_callback = _back_callback_for_origin(language_origin)
             await query.answer()
             if query.message:
                 try:
                     await query.message.edit_text(
                         _language_picker_text(lang),
-                        reply_markup=language_keyboard(language=lang, with_back=True),
+                        reply_markup=language_keyboard(
+                            language=lang,
+                            with_back=True,
+                            back_callback=back_callback,
+                        ),
                         parse_mode="MarkdownV2",
                     )
                 except TelegramBadRequest:
                     await query.message.answer(
                         _language_picker_text(lang),
-                        reply_markup=language_keyboard(language=lang, with_back=True),
+                        reply_markup=language_keyboard(
+                            language=lang,
+                            with_back=True,
+                            back_callback=back_callback,
+                        ),
                         parse_mode="MarkdownV2",
                     )
             return
 
-        if data == "menu:personality" or data.startswith("menu:personality:page:"):
-            page = 0
-            if data.startswith("menu:personality:page:"):
-                raw_page = data.rsplit(":", maxsplit=1)[-1]
-                try:
-                    page = int(raw_page)
-                except ValueError:
-                    page = 0
+        personality_payload = _parse_personality_menu_payload(data)
+        if personality_payload is not None:
+            page, origin = personality_payload
+            back_callback = _back_callback_for_origin(origin)
             await query.answer()
             custom_items = await _custom_personality_items(query.from_user.id)
             if query.message:
@@ -2985,6 +3561,9 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                             active_personality=user.personality,
                             page=page,
                             with_back=True,
+                            back_callback=back_callback,
+                            callback_prefix=f"menu:personality:{origin}",
+                            custom_instructions_callback=f"menu:custom_instructions:manage:{origin}",
                         ),
                         parse_mode="MarkdownV2",
                     )
@@ -2997,26 +3576,20 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                             active_personality=user.personality,
                             page=page,
                             with_back=True,
+                            back_callback=back_callback,
+                            callback_prefix=f"menu:personality:{origin}",
+                            custom_instructions_callback=f"menu:custom_instructions:manage:{origin}",
                         ),
                         parse_mode="MarkdownV2",
                     )
             return
 
-        if (
-            data == "menu:custom_instructions"
-            or data == "menu:custom_instructions:manage"
-            or data.startswith("menu:custom_instructions:manage:page:")
-        ):
-            page = 0
-            if data.startswith("menu:custom_instructions:manage:page:"):
-                raw_page = data.rsplit(":", maxsplit=1)[-1]
-                try:
-                    page = int(raw_page)
-                except ValueError:
-                    page = 0
+        custom_manage_payload = _parse_custom_manage_menu_payload(data)
+        if custom_manage_payload is not None:
+            page, origin = custom_manage_payload
             await state.clear()
             await query.answer()
-            text, _, markup = await _custom_instructions_manage_view(query.from_user.id, page=page)
+            text, _, markup = await _custom_instructions_manage_view(query.from_user.id, page=page, source=origin)
             if query.message:
                 try:
                     await query.message.edit_text(
@@ -3032,37 +3605,51 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                     )
             return
 
-        if data == "menu:custom_instructions:new":
+        custom_new_origin = _parse_custom_new_origin(data)
+        if custom_new_origin is not None:
             await state.clear()
+            await state.update_data(custom_origin=custom_new_origin)
             await state.set_state(SetupStates.waiting_custom_instruction_name)
             await query.answer()
             if query.message:
                 await query.message.answer(
                     _md(lang, "ask_custom_instruction_name"),
-                    reply_markup=cancel_input_keyboard(language=lang),
+                    reply_markup=cancel_input_keyboard(
+                        language=lang,
+                        callback_data=f"menu:custom_instructions:manage:{custom_new_origin}",
+                    ),
                     parse_mode="MarkdownV2",
                 )
             return
 
-        if data == "menu:apikey":
+        apikey_origin = _parse_simple_menu_origin(data, "apikey", default="menu")
+        if apikey_origin is not None:
             await state.set_state(SetupStates.waiting_api_key)
             await query.answer()
             if query.message:
                 await query.message.answer(
                     _apikey_prompt_text(lang, provider_label(user.provider)),
-                    reply_markup=cancel_input_keyboard(language=lang),
+                    reply_markup=cancel_input_keyboard(
+                        language=lang,
+                        callback_data=_back_callback_for_origin(apikey_origin),
+                    ),
                     parse_mode="MarkdownV2",
                 )
             return
 
-        if data == "menu:model":
+        model_origin = _parse_simple_menu_origin(data, "model", default="menu")
+        if model_origin is not None:
+            back_callback = _back_callback_for_origin(model_origin)
             await query.answer()
             if user.use_personal_api:
                 await state.set_state(SetupStates.waiting_model)
                 if query.message:
                     await query.message.answer(
                         _md(lang, "ask_model"),
-                        reply_markup=use_bot_ai_keyboard(language=lang),
+                        reply_markup=use_bot_ai_keyboard(
+                            language=lang,
+                            callback_data=f"model:use_bot_ai:{model_origin}",
+                        ),
                         parse_mode="MarkdownV2",
                     )
                 return
@@ -3076,6 +3663,8 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                             language=lang,
                             active_model=_normalize_shared_model_id(user.model),
                             personal_api_enabled=user.use_personal_api,
+                            origin=model_origin,
+                            back_callback=back_callback,
                         ),
                         parse_mode="MarkdownV2",
                     )
@@ -3086,17 +3675,24 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                             language=lang,
                             active_model=_normalize_shared_model_id(user.model),
                             personal_api_enabled=user.use_personal_api,
+                            origin=model_origin,
+                            back_callback=back_callback,
                         ),
                         parse_mode="MarkdownV2",
                     )
             return
 
-        if data == "menu:baseurl":
+        baseurl_origin = _parse_simple_menu_origin(data, "baseurl", default="menu")
+        if baseurl_origin is not None:
             await state.set_state(SetupStates.waiting_base_url)
             await query.answer()
             if query.message:
                 await query.message.answer(
                     _md(lang, "ask_base_url"),
+                    reply_markup=cancel_input_keyboard(
+                        language=lang,
+                        callback_data=_back_callback_for_origin(baseurl_origin),
+                    ),
                     parse_mode="MarkdownV2",
                 )
             return
@@ -3336,7 +3932,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
             media_hints_enabled=media_hints_enabled,
         )
 
-        await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+        await _send_chat_action_safe(message, ChatAction.TYPING)
 
         # External web search path for fresh/live information.
         wants_search = _message_requests_web_search(raw_text)
@@ -3548,7 +4144,7 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
         parsed = _parse_time_conversion_query(raw_text)
         if parsed is not None:
             time_minutes, had_am_pm, from_loc, to_loc = parsed
-            await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+            await _send_chat_action_safe(message, ChatAction.TYPING)
             try:
                 from_url = await _find_time_is_url(from_loc)
                 to_url = await _find_time_is_url(to_loc)
@@ -3616,15 +4212,28 @@ def build_router(*, db: Database, llm: LLMService, settings: Settings) -> Router
                 auto_search_needed,
                 do_external_search,
             )
-            response = await llm.generate_reply(
-                provider_id=provider_id,
-                api_key=api_key,
-                model=selected_model,
-                messages=context,
-                custom_base_url=custom_base_url,
-                enable_web_search=enable_openai_web_search,
-                web_search_tool_choice=tool_choice,
-            )
+            if user.realtime_answers_enabled:
+                response = await _generate_reply_with_realtime_draft(
+                    llm=llm,
+                    message=message,
+                    provider_id=provider_id,
+                    api_key=api_key,
+                    model=selected_model,
+                    messages=context,
+                    custom_base_url=custom_base_url,
+                    enable_web_search=enable_openai_web_search,
+                    web_search_tool_choice=tool_choice,
+                )
+            else:
+                response = await llm.generate_reply(
+                    provider_id=provider_id,
+                    api_key=api_key,
+                    model=selected_model,
+                    messages=context,
+                    custom_base_url=custom_base_url,
+                    enable_web_search=enable_openai_web_search,
+                    web_search_tool_choice=tool_choice,
+                )
         except LLMServiceError as exc:
             human_error = _humanize_error(
                 lang=lang,
@@ -4073,14 +4682,13 @@ def _looks_like_bot_models_question(text: str) -> bool:
         "what models are available",
         "what models does the bot have",
         "which models are in the bot",
-        "models in shared ai",
-        "shared ai models",
+        "models in urai",
+        "urai models",
         "какие модели есть",
         "какие модели в боте",
         "какие модели доступны",
-        "какие модели у shared ai",
-        "модели shared ai",
         "какие модели у urai",
+        "модели urai",
         "список моделей",
     )
     if any(p in value for p in phrases):
@@ -4088,7 +4696,7 @@ def _looks_like_bot_models_question(text: str) -> bool:
 
     tokens = _text_tokens(value)
     model_tokens = {"model", "models", "модель", "модели", "модельки"}
-    bot_tokens = {"bot", "urai", "shared", "ai", "бот", "ии", "мой", "общий"}
+    bot_tokens = {"bot", "urai", "ai", "бот", "ии"}
     return bool(tokens & model_tokens) and bool(tokens & bot_tokens)
 
 
@@ -4152,7 +4760,7 @@ def _shared_models_prompt_for_message(message_id: int) -> str:
     hint = style_hints[message_id % len(style_hints)]
     return (
         "Model facts for UrAI (use only when user asks about available models in the bot):\n"
-        "Shared AI has exactly 4 models:\n"
+        "UrAI has exactly 4 models:\n"
         "1) GPT 4\n"
         "2) LLaMA 4 (Media support)\n"
         "3) LLaMA 3\n"
@@ -4175,7 +4783,7 @@ def _capabilities_prompt_for_message(message_id: int, *, media_hints_enabled: bo
         "AI chat in selected personality and language.",
         "Internet search via /i and automatic web search when relevant.",
         "Access to fresh/live web info with sources when available.",
-        "Model/provider controls: choose provider, model, base URL, and API mode (shared AI or own API key).",
+        "Model/provider controls: choose provider, model, base URL, and API mode (UrAI or own API key).",
         "Settings hub and quick controls from Telegram UI.",
         "Personality switching and custom user instructions.",
         "Chat history browsing and starting a new clean chat.",
@@ -4187,7 +4795,7 @@ def _capabilities_prompt_for_message(message_id: int, *, media_hints_enabled: bo
         )
     items.extend(
         [
-            "Token/quota visibility in shared mode.",
+            "Token/quota visibility in UrAI mode.",
             "Privacy: developer does NOT have access to user voice/media files; processing goes through API keys/providers with end-to-end data flow.",
             "Interface languages: en, ru, es, fr, tr, ar, de, it, pt, uk, hi.",
             "Core commands: /start, /help, /privacy, /languages, /provider, /personality, /apikey, /deletekey, "
@@ -6522,6 +7130,83 @@ def _estimate_shared_output_cost(*, model_id: str, text: str) -> int:
     return output_units * profile["out_per_200_chars"]
 
 
+async def _generate_reply_with_realtime_draft(
+    *,
+    llm: LLMService,
+    message: Message,
+    provider_id: str,
+    api_key: str,
+    model: str | None,
+    messages: list[dict[str, Any]],
+    custom_base_url: str | None = None,
+    enable_web_search: bool = False,
+    web_search_tool_choice: str = "auto",
+    temperature: float = 0.7,
+) -> str:
+    response = ""
+    chat_type = getattr(message.chat, "type", "")
+    chat_type_value = getattr(chat_type, "value", chat_type)
+    can_send_draft = hasattr(message.bot, "send_message_draft") and chat_type_value == "private"
+    draft_id = (uuid4().int % 2_147_483_646) + 1
+    last_sent_len = 0
+    last_sent_at = monotonic()
+
+    try:
+        async for chunk in llm.generate_reply_stream(
+            provider_id=provider_id,
+            api_key=api_key,
+            model=model,
+            messages=messages,
+            custom_base_url=custom_base_url,
+            enable_web_search=enable_web_search,
+            web_search_tool_choice=web_search_tool_choice,
+            temperature=temperature,
+        ):
+            if not chunk:
+                continue
+            response += chunk
+            if not can_send_draft:
+                continue
+
+            draft_text = response[:REALTIME_DRAFT_MAX_CHARS]
+            draft_len = len(draft_text)
+            if draft_len <= last_sent_len:
+                continue
+            now = monotonic()
+            should_push = (
+                (draft_len - last_sent_len) >= REALTIME_DRAFT_MIN_APPEND_CHARS
+                or (now - last_sent_at) >= REALTIME_DRAFT_MIN_INTERVAL_SECONDS
+            )
+            if not should_push:
+                continue
+            try:
+                await message.bot.send_message_draft(
+                    chat_id=message.chat.id,
+                    draft_id=draft_id,
+                    text=draft_text,
+                )
+                last_sent_len = draft_len
+                last_sent_at = now
+            except Exception:  # noqa: BLE001
+                can_send_draft = False
+    except LLMServiceError:
+        # If streaming failed, fall back to non-stream completion to keep reliability.
+        response = await llm.generate_reply(
+            provider_id=provider_id,
+            api_key=api_key,
+            model=model,
+            messages=messages,
+            custom_base_url=custom_base_url,
+            enable_web_search=enable_web_search,
+            web_search_tool_choice=web_search_tool_choice,
+            temperature=temperature,
+        )
+
+    if not response.strip():
+        raise LLMServiceError("Provider returned empty response")
+    return response
+
+
 async def _send_assistant_response(
     *,
     message: Message,
@@ -6532,7 +7217,7 @@ async def _send_assistant_response(
     display_response = _prepare_response_for_display(response)
     sources_markup = sources_keyboard(token=sources_token, language=lang) if sources_token else None
 
-    if _should_send_response_as_image(response):
+    if _should_send_response_as_image(display_response):
         if await _send_response_as_image(
             message=message,
             response=display_response,
@@ -6541,29 +7226,19 @@ async def _send_assistant_response(
         ):
             return
 
-    try:
-        chunks = _split_message(display_response)
-        last_index = len(chunks) - 1
-        for index, chunk in enumerate(chunks):
-            escaped_chunk = render_llm_markdown_v2(chunk, parse_mode="MarkdownV2")
-            reply_markup = sources_markup if index == last_index else None
-            await message.answer(escaped_chunk, parse_mode="MarkdownV2", reply_markup=reply_markup)
+    chunks = [chunk for chunk in _split_message(display_response) if chunk]
+    if not chunks:
         return
-    except TelegramBadRequest:
-        # If MarkdownV2 formatting fails, retry with image to preserve full content.
-        if await _send_response_as_image(
-            message=message,
-            response=display_response,
-            lang=lang,
-            reply_markup=sources_markup,
-        ):
-            return
 
-    chunks = _split_message(display_response)
     last_index = len(chunks) - 1
     for index, chunk in enumerate(chunks):
         reply_markup = sources_markup if index == last_index else None
-        await message.answer(chunk, reply_markup=reply_markup)
+        try:
+            escaped_chunk = render_llm_markdown_v2(chunk, parse_mode="MarkdownV2")
+            await message.answer(escaped_chunk, parse_mode="MarkdownV2", reply_markup=reply_markup)
+        except TelegramBadRequest as exc:
+            logger.warning("MarkdownV2 send failed for chunk %s/%s: %s", index + 1, len(chunks), exc)
+            await message.answer(chunk, reply_markup=reply_markup)
 
 
 def _should_send_response_as_image(text: str) -> bool:
@@ -6690,10 +7365,79 @@ def _replace_latex_text_styles(text: str) -> str:
         updated = current
         for pattern, replacement in replacers:
             updated = pattern.sub(replacement, updated)
+        updated = _replace_latex_text_styles_with_balanced_groups(updated)
         if updated == current:
             break
         current = updated
     return current
+
+
+def _replace_latex_text_styles_with_balanced_groups(text: str) -> str:
+    style_by_command = {
+        "textbf": "bold",
+        "mathbf": "bold",
+        "boldsymbol": "bold",
+        "textit": "italic",
+        "emph": "italic",
+    }
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9_])(\\+)?(textbf|mathbf|boldsymbol|textit|emph)\s*([({])",
+        flags=re.DOTALL,
+    )
+    current = text
+    for _ in range(8):
+        changed = False
+        parts: list[str] = []
+        index = 0
+
+        while index < len(current):
+            match = pattern.search(current, index)
+            if match is None:
+                parts.append(current[index:])
+                break
+
+            parts.append(current[index:match.start()])
+            command = str(match.group(2) or "")
+            opener = str(match.group(3) or "")
+            closer = ")" if opener == "(" else "}"
+            open_index = match.end() - 1
+            close_index = _find_matching_group_end(current, start=open_index, opening=opener, closing=closer)
+            if close_index is None:
+                parts.append(current[match.start():match.end()])
+                index = match.end()
+                continue
+
+            inner = current[open_index + 1 : close_index]
+            style = style_by_command.get(command)
+            if style == "bold":
+                parts.append(f"**{inner}**")
+            elif style == "italic":
+                parts.append(f"*{inner}*")
+            else:
+                parts.append(current[match.start() : close_index + 1])
+            index = close_index + 1
+            changed = True
+
+        updated = "".join(parts)
+        current = updated
+        if not changed:
+            break
+
+    return current
+
+
+def _find_matching_group_end(text: str, *, start: int, opening: str, closing: str) -> int | None:
+    depth = 0
+    for index, ch in enumerate(text[start:], start=start):
+        if ch == opening:
+            depth += 1
+        elif ch == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+            if depth < 0:
+                return None
+    return None
 
 
 def _latex_command_replacer(match: re.Match[str]) -> str:
@@ -6803,6 +7547,31 @@ def _looks_math_like_line(line: str) -> bool:
     )
 
 
+async def _send_chat_action_safe(message: Message, action: ChatAction) -> None:
+    chat_id = message.chat.id
+    action_key = action.value if hasattr(action, "value") else str(action)
+    key = (chat_id, action_key)
+    now = monotonic()
+    next_allowed = _CHAT_ACTION_NEXT_ALLOWED.get(key, 0.0)
+    if now < next_allowed:
+        return
+    try:
+        await message.bot.send_chat_action(chat_id=chat_id, action=action)
+    except TelegramRetryAfter as exc:
+        retry_after = max(float(getattr(exc, "retry_after", 0) or 0), CHAT_ACTION_MIN_INTERVAL_SECONDS)
+        _CHAT_ACTION_NEXT_ALLOWED[key] = now + retry_after
+        logging.debug(
+            "send_chat_action rate-limited: chat_id=%s action=%s retry_after=%.2f",
+            chat_id,
+            action_key,
+            retry_after,
+        )
+    except TelegramBadRequest:
+        _CHAT_ACTION_NEXT_ALLOWED[key] = now + CHAT_ACTION_MIN_INTERVAL_SECONDS
+    else:
+        _CHAT_ACTION_NEXT_ALLOWED[key] = now + CHAT_ACTION_MIN_INTERVAL_SECONDS
+
+
 async def _send_response_as_image(
     *,
     message: Message,
@@ -6820,7 +7589,7 @@ async def _send_response_as_image(
     if not pages:
         return False
 
-    await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.UPLOAD_PHOTO)
+    await _send_chat_action_safe(message, ChatAction.UPLOAD_PHOTO)
     for index, page in enumerate(pages):
         if index == 0:
             await message.answer_photo(
@@ -7804,6 +8573,35 @@ def _consume_keycap_cluster(value: str, start: int) -> int | None:
     return None
 
 
+def _consume_regional_indicator_flag(value: str, start: int) -> int | None:
+    if start + 1 >= len(value):
+        return None
+    first = ord(value[start])
+    second = ord(value[start + 1])
+    if 0x1F1E6 <= first <= 0x1F1FF and 0x1F1E6 <= second <= 0x1F1FF:
+        return start + 2
+    return None
+
+
+def _consume_tag_flag_cluster(value: str, start: int) -> int | None:
+    if start >= len(value) or ord(value[start]) != 0x1F3F4:
+        return None
+    idx = start + 1
+    if idx < len(value) and ord(value[idx]) in {0xFE0E, 0xFE0F}:
+        idx += 1
+
+    tag_count = 0
+    while idx < len(value) and 0xE0061 <= ord(value[idx]) <= 0xE007A:
+        idx += 1
+        tag_count += 1
+
+    if tag_count == 0:
+        return None
+    if idx < len(value) and ord(value[idx]) == 0xE007F:
+        return idx + 1
+    return None
+
+
 def _emoji_cluster_spans(value: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     idx = 0
@@ -7813,6 +8611,18 @@ def _emoji_cluster_spans(value: str) -> list[tuple[int, int]]:
         if keycap_end is not None:
             spans.append((idx, keycap_end))
             idx = keycap_end
+            continue
+
+        regional_flag_end = _consume_regional_indicator_flag(value, idx)
+        if regional_flag_end is not None:
+            spans.append((idx, regional_flag_end))
+            idx = regional_flag_end
+            continue
+
+        tag_flag_end = _consume_tag_flag_cluster(value, idx)
+        if tag_flag_end is not None:
+            spans.append((idx, tag_flag_end))
+            idx = tag_flag_end
             continue
 
         ch = value[idx]
@@ -8361,13 +9171,15 @@ def _classify_image_line(raw_line: str) -> dict[str, Any]:
 
 
 def _extract_fraction_parts_from_line(line: str) -> tuple[str, str] | None:
-    value = (line or "").strip()
+    value = _strip_markdown_wrappers((line or "").strip())
     if not value:
         return None
     lowered = value.lower()
     if "http://" in lowered or "https://" in lowered:
         return None
     if len(value) > 420:
+        return None
+    if _contains_top_level_chars(value, forbidden={"=", "<", ">", ":", ";", "?", "!"}):
         return None
 
     parts = _split_top_level_fraction(value)
@@ -8382,6 +9194,58 @@ def _extract_fraction_parts_from_line(line: str) -> tuple[str, str] | None:
     if len(left) > 220 or len(right) > 220:
         return None
     return left, right
+
+
+def _strip_markdown_wrappers(value: str) -> str:
+    current = (value or "").strip()
+    wrappers = (("**", "**"), ("__", "__"), ("~~", "~~"), ("`", "`"), ("*", "*"), ("_", "_"))
+    for _ in range(6):
+        updated = current
+        for prefix, suffix in wrappers:
+            if not (updated.startswith(prefix) and updated.endswith(suffix)):
+                continue
+            if len(updated) <= len(prefix) + len(suffix):
+                continue
+            inner = updated[len(prefix) : len(updated) - len(suffix)].strip()
+            if not inner:
+                continue
+            updated = inner
+            break
+        if updated == current:
+            break
+        current = updated
+    return current
+
+
+def _contains_top_level_chars(value: str, *, forbidden: set[str]) -> bool:
+    depth_paren = 0
+    depth_bracket = 0
+    depth_brace = 0
+
+    for ch in value:
+        if ch == "(":
+            depth_paren += 1
+            continue
+        if ch == ")":
+            depth_paren = max(0, depth_paren - 1)
+            continue
+        if ch == "[":
+            depth_bracket += 1
+            continue
+        if ch == "]":
+            depth_bracket = max(0, depth_bracket - 1)
+            continue
+        if ch == "{":
+            depth_brace += 1
+            continue
+        if ch == "}":
+            depth_brace = max(0, depth_brace - 1)
+            continue
+        if depth_paren or depth_bracket or depth_brace:
+            continue
+        if ch in forbidden:
+            return True
+    return False
 
 
 def _split_top_level_fraction(value: str) -> tuple[str, str] | None:

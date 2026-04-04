@@ -192,6 +192,7 @@ Regular text (with symbols).
 * list item one
   * list item two
 _italic_ and ~~strike~~ with [docs](https://example.com/path).
+Term: __underline__ and hidden ||secret||.
 > quoted line
 
 ```python
@@ -211,8 +212,10 @@ This is **important**.
     assert "  ◦ list item two" in rendered, "Indented single-star list item should convert to bullet"
     assert "_italic_" in rendered, "Italic markdown should be preserved"
     assert "~strike~" in rendered, "Strikethrough markdown should be preserved"
+    assert "__underline__" in rendered, "Underline markdown should be preserved"
+    assert "||secret||" in rendered, "Spoiler markdown should be preserved"
     assert "[docs](https://example.com/path)" in rendered, "Markdown links should be preserved"
-    assert "❝ quoted line" in rendered, "Blockquote should be normalized"
+    assert "> quoted line" in rendered, "Blockquote should be rendered as Telegram quote"
     assert "value = 5 * 2" in rendered, "Code block content should be preserved"
     print("✅ PASS: LLM markdown rendered safely for Telegram\n")
 
@@ -238,10 +241,32 @@ def test_markdown_table_rendering():
     print("✅ PASS: Markdown table converted to readable Telegram-safe table\n")
 
 
+def test_html_markup_fallback_rendering():
+    """Test fallback conversion from HTML-like LLM output to MarkdownV2."""
+    print("=" * 70)
+    print("TEST 7: HTML Markup Fallback Rendering")
+    print("=" * 70)
+
+    text = """<b>Important</b> note with <u>underline</u> and <tg-spoiler>hidden</tg-spoiler>.
+<blockquote>Quoted line 1
+Quoted line 2</blockquote>
+"""
+    rendered = render_llm_markdown_v2(text)
+    print(f"Input:  {repr(text)}")
+    print(f"Output: {repr(rendered)}")
+
+    assert "*Important*" in rendered, "HTML <b> should convert to Telegram bold"
+    assert "__underline__" in rendered, "HTML <u> should convert to Telegram underline"
+    assert "||hidden||" in rendered, "HTML spoiler should convert to Telegram spoiler"
+    assert "> Quoted line 1" in rendered and "> Quoted line 2" in rendered, "HTML blockquote should convert to Telegram quote lines"
+    assert "<b>" not in rendered and "<u>" not in rendered and "<blockquote>" not in rendered, "Raw HTML tags should not leak to output"
+    print("✅ PASS: HTML-like markup converted to Telegram-safe MarkdownV2\n")
+
+
 def test_all_special_characters():
     """Test all MarkdownV2 special characters that need escaping."""
     print("=" * 70)
-    print("TEST 7: All MarkdownV2 Special Characters")
+    print("TEST 8: All MarkdownV2 Special Characters")
     print("=" * 70)
     
     # All characters that need escaping
@@ -286,6 +311,7 @@ def main():
         test_real_world_scenarios()
         test_llm_markdown_rendering()
         test_markdown_table_rendering()
+        test_html_markup_fallback_rendering()
         test_all_special_characters()
         print_summary()
         return 0

@@ -14,7 +14,7 @@ class Provider:
 PROVIDERS: dict[str, Provider] = {
     "shared_ai": Provider(
         id="shared_ai",
-        title="Shared AI",
+        title="UrAI",
         default_model="",
         base_url=None,
     ),

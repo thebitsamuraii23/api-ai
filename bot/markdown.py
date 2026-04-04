@@ -42,6 +42,24 @@ _MARKDOWN_TABLE_SEPARATOR_RE = re.compile(
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)")
 _INLINE_CODE_RE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
 _HORIZONTAL_RULE_RE = re.compile(r"^\s*([-*_])(?:\s*\1){2,}\s*$")
+_HTML_BREAK_RE = re.compile(r"(?i)<br\s*/?>")
+_HTML_BLOCKQUOTE_RE = re.compile(r"(?is)<blockquote(?:\s+expandable)?>(.*?)</blockquote>")
+_HTML_PRE_CODE_RE = re.compile(
+    r"(?is)<pre>\s*<code(?:\s+class=[\"']language-([a-zA-Z0-9_+\-#.]+)[\"'])?\s*>(.*?)</code>\s*</pre>"
+)
+_HTML_PRE_RE = re.compile(r"(?is)<pre>(.*?)</pre>")
+_HTML_INLINE_CODE_RE = re.compile(r"(?is)<code>(.*?)</code>")
+_HTML_INLINE_STYLE_TAGS: tuple[tuple[str, str], ...] = (
+    ("b", "**"),
+    ("strong", "**"),
+    ("i", "_"),
+    ("em", "_"),
+    ("u", "__"),
+    ("ins", "__"),
+    ("s", "~~"),
+    ("strike", "~~"),
+    ("del", "~~"),
+)
 
 
 def escape_markdown_v2(text: str) -> str:
@@ -330,10 +348,6 @@ def _normalize_markdown_lines(segment: str) -> str:
             title = heading_match.group(1).strip()
             line = f"**{title}**" if title else ""
         else:
-            quote_match = re.match(r"^\s*>\s?(.*)$", line)
-            if quote_match:
-                quote_text = quote_match.group(1).strip()
-                line = f"❝ {quote_text}" if quote_text else "❝"
             if _HORIZONTAL_RULE_RE.fullmatch(line.strip() or ""):
                 line = "────────────"
             line = re.sub(r"^(?P<indent>[ \t]*)[*+-]\s+", r"\g<indent>◦ ", line)
@@ -344,17 +358,73 @@ def _normalize_markdown_lines(segment: str) -> str:
     return result
 
 
+def _normalize_html_markup_in_segment(segment: str) -> str:
+    normalized = segment.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = _HTML_BREAK_RE.sub("\n", normalized)
+
+    def pre_code_replacer(match: re.Match[str]) -> str:
+        lang = (match.group(1) or "").strip()
+        code = (match.group(2) or "").strip("\n")
+        if lang:
+            return f"```{lang}\n{code}\n```"
+        return f"```\n{code}\n```"
+
+    def pre_replacer(match: re.Match[str]) -> str:
+        code = (match.group(1) or "").strip("\n")
+        return f"```\n{code}\n```"
+
+    def inline_code_replacer(match: re.Match[str]) -> str:
+        code = (match.group(1) or "")
+        if "\n" in code:
+            return f"```\n{code.strip('\n')}\n```"
+        return f"`{code.strip()}`"
+
+    def blockquote_replacer(match: re.Match[str]) -> str:
+        body = (match.group(1) or "").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+        if not body.strip():
+            return ""
+        lines = body.split("\n")
+        rendered: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            rendered.append(">" if not stripped else f"> {stripped}")
+        return "\n".join(rendered)
+
+    normalized = _HTML_PRE_CODE_RE.sub(pre_code_replacer, normalized)
+    normalized = _HTML_PRE_RE.sub(pre_replacer, normalized)
+    normalized = _HTML_INLINE_CODE_RE.sub(inline_code_replacer, normalized)
+    normalized = _HTML_BLOCKQUOTE_RE.sub(blockquote_replacer, normalized)
+    normalized = re.sub(r"(?is)<span\s+class=[\"']tg-spoiler[\"']\s*>(.*?)</span>", r"||\1||", normalized)
+    normalized = re.sub(r"(?is)<tg-spoiler>(.*?)</tg-spoiler>", r"||\1||", normalized)
+
+    for tag, marker in _HTML_INLINE_STYLE_TAGS:
+        tag_pattern = re.compile(fr"(?is)<{tag}(?:\s+[^>]*)?>(.*?)</{tag}>")
+        for _ in range(6):
+            updated = tag_pattern.sub(
+                lambda m, current_marker=marker: f"{current_marker}{(m.group(1) or '').strip()}{current_marker}",
+                normalized,
+            )
+            if updated == normalized:
+                break
+            normalized = updated
+    return normalized
+
+
 def _escape_segment_with_markdown(segment: str) -> str:
     """
     Escape MarkdownV2 special chars while preserving common markdown styles.
     Supported inline styles in plain-text segments:
-    - bold: **text**, __text__
+    - bold: **text**
+    - underline: __text__
     - italic: *text*, _text_
     - strikethrough: ~~text~~
+    - spoiler: ||text||
     - inline code: `code`
     - links: [label](https://...)
+    - block quote lines: > text
     """
-    normalized = _normalize_markdown_lines(segment)
+    normalized = _normalize_html_markup_in_segment(segment)
+    normalized = _normalize_markdown_lines(normalized)
     placeholders: list[tuple[str, str]] = []
 
     def add_placeholder(rendered: str) -> str:
@@ -363,10 +433,16 @@ def _escape_segment_with_markdown(segment: str) -> str:
         return token
 
     def bold_replacer(match: re.Match[str]) -> str:
-        inner = (match.group(1) or match.group(2) or "").strip()
+        inner = (match.group(1) or "").strip()
         if not inner:
             return ""
         return add_placeholder(f"*{escape_markdown_v2(inner)}*")
+
+    def underline_replacer(match: re.Match[str]) -> str:
+        inner = (match.group(1) or "").strip()
+        if not inner:
+            return ""
+        return add_placeholder(f"__{escape_markdown_v2(inner)}__")
 
     def italic_replacer(match: re.Match[str]) -> str:
         inner = (match.group(1) or match.group(2) or "").strip()
@@ -380,6 +456,12 @@ def _escape_segment_with_markdown(segment: str) -> str:
             return ""
         return add_placeholder(f"~{escape_markdown_v2(inner)}~")
 
+    def spoiler_replacer(match: re.Match[str]) -> str:
+        inner = (match.group(1) or "").strip()
+        if not inner:
+            return ""
+        return add_placeholder(f"||{escape_markdown_v2(inner)}||")
+
     def code_replacer(match: re.Match[str]) -> str:
         inner = match.group(1)
         return add_placeholder(f"`{_escape_inline_code(inner)}`")
@@ -389,11 +471,20 @@ def _escape_segment_with_markdown(segment: str) -> str:
         url = match.group(2)
         return add_placeholder(f"[{escape_markdown_v2(label)}]({_escape_markdown_v2_url(url)})")
 
+    def quote_replacer(match: re.Match[str]) -> str:
+        quote_text = (match.group(1) or "").strip()
+        if not quote_text:
+            return add_placeholder(">")
+        return add_placeholder(f"> {escape_markdown_v2(quote_text)}")
+
     normalized = _MARKDOWN_LINK_RE.sub(link_replacer, normalized)
     normalized = _INLINE_CODE_RE.sub(code_replacer, normalized)
-    normalized = re.sub(r"\*\*(.+?)\*\*|__(.+?)__", bold_replacer, normalized)
+    normalized = re.sub(r"\*\*(.+?)\*\*", bold_replacer, normalized)
+    normalized = re.sub(r"__(.+?)__", underline_replacer, normalized)
     normalized = re.sub(r"~~(.+?)~~", strike_replacer, normalized)
+    normalized = re.sub(r"\|\|(.+?)\|\|", spoiler_replacer, normalized)
     normalized = re.sub(r"(?<!\*)\*([^*\n][^*\n]*?)\*(?!\*)|(?<!\w)_([^_\n]+)_(?!\w)", italic_replacer, normalized)
+    normalized = re.sub(r"(?m)^\s*>\s?(.*)$", quote_replacer, normalized)
     escaped = escape_markdown_v2(normalized)
     for token, rendered in placeholders:
         escaped = escaped.replace(token, rendered)
